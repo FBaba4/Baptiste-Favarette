@@ -14,29 +14,36 @@ const PERSONNAGES_DISPONIBLES = [
     desc: "Fragile mais dévastateur. Dégâts très élevés." },
 ];
 
-// ── Construction de la carte ───────────────────────────────────────────────────
+// ── Construction de la carte (plan inspiré du campus universitaire) ────────────
 function creerCarte(nomLieu) {
   const carte = new Carte(nomLieu, 15, 12);
 
-  // Murs supplémentaires aléatoires (obstacles)
-  const obstacles = [
-    [3,3],[3,4],[7,2],[7,3],[11,5],[11,6],[4,8],[5,8],[9,9],[10,9],
-    [6,5],[2,7],[12,3],[8,7]
-  ];
-  obstacles.forEach(([x, y]) => { carte.grille[y][x] = "mur"; });
+  // Bâtiments : blocs de murs formant des salles/couloirs comme un campus
+  // Aile gauche (bâtiment principal)
+  [[1,3],[1,4],[1,5],[2,3],[3,3],[3,4],[3,5],[2,5]].forEach(([x,y]) => { carte.grille[y][x] = "mur"; });
+  // Couloir vitré horizontal central
+  [[5,5],[6,5],[7,5],[8,5],[9,5]].forEach(([x,y]) => { carte.grille[y][x] = "mur"; });
+  // Bâtiment circulaire (droite) — bloc carré simulant un bâtiment rond
+  [[11,3],[12,3],[11,4],[12,4],[11,5],[12,5]].forEach(([x,y]) => { carte.grille[y][x] = "mur"; });
+  // Aile bas-gauche
+  [[2,8],[3,8],[4,8],[2,9],[4,9],[2,10],[3,10],[4,10]].forEach(([x,y]) => { carte.grille[y][x] = "mur"; });
+  // Bâtiment bas-droit
+  [[10,8],[11,8],[12,8],[10,9],[12,9],[10,10],[11,10],[12,10]].forEach(([x,y]) => { carte.grille[y][x] = "mur"; });
+  // Muret central (séparation place)
+  [[7,2],[7,3]].forEach(([x,y]) => { carte.grille[y][x] = "mur"; });
 
-  // Ennemis
-  carte.ajouterEnnemi(new Ennemi("Gobelin",    30, 4, 2, 8,  15));
-  carte.ajouterEnnemi(new Ennemi("Squelette",  40, 9, 4, 10, 20));
-  carte.ajouterEnnemi(new Ennemi("Loup",       35, 5, 7, 9,  18));
-  carte.ajouterEnnemi(new Ennemi("Orc",        50, 12,8, 12, 25));
-  carte.ajouterEnnemi(new Boss("Dragon Ancien",120,11,2, 20, 100));
+  // Ennemis (positionnés dans les zones accessibles de la carte)
+  carte.ajouterEnnemi(new Ennemi("Gobelin",    30, 5, 2, 8,  15));
+  carte.ajouterEnnemi(new Ennemi("Squelette",  40, 9, 3, 10, 20));
+  carte.ajouterEnnemi(new Ennemi("Loup",       35, 6, 7, 9,  18));
+  carte.ajouterEnnemi(new Ennemi("Orc",        50, 8, 9, 12, 25));
+  carte.ajouterEnnemi(new Boss("Dragon Ancien",120,13,6, 20, 100));
 
-  // Objets au sol
-  carte.ajouterObjetSol(new Consommable("Potion", "Restaure 25 PV", 25), 6, 3);
-  carte.ajouterObjetSol(new Arme("Hache", "Arme lourde", 15), 2, 5);
-  carte.ajouterObjetSol(new Consommable("Herbes médicinales", "Restaure 15 PV", 15), 10, 6);
-  carte.ajouterObjetSol(new Consommable("Grande Potion", "Restaure 40 PV", 40), 13, 10);
+  // Objets au sol (dans la place centrale et les couloirs)
+  carte.ajouterObjetSol(new Consommable("Potion",           "Restaure 25 PV", 25),  5, 4);
+  carte.ajouterObjetSol(new Arme("Hache de guerre",         "Arme lourde",    15),  4, 2);
+  carte.ajouterObjetSol(new Consommable("Herbes méd.",      "Restaure 15 PV", 15), 10, 7);
+  carte.ajouterObjetSol(new Consommable("Grande Potion",    "Restaure 40 PV", 40),  7, 10);
 
   return carte;
 }
@@ -84,35 +91,11 @@ function renderSelection() {
 
 function renderExploration() {
   const h = jeu.heros;
-  const grille = jeu.carte.afficher();
-  const cellSize = 38;
-
-  let gridHTML = '<div class="grille">';
-  for (let y = 0; y < jeu.carte.hauteur; y++) {
-    gridHTML += '<div class="ligne">';
-    for (let x = 0; x < jeu.carte.largeur; x++) {
-      const estHeros = (x === h.positionX && y === h.positionY);
-      const ennemis = jeu.carte.getEnnemisEnPosition(x, y);
-      const objetSol = jeu.carte.getObjetEnPosition(x, y);
-      const type = grille[y][x];
-
-      let contenu = "";
-      let cls = `cellule cellule-${type}`;
-
-      if (estHeros) { contenu = h.classe === "guerrier" ? "🧙" : h.classe === "archer" ? "🏹" : "🔮"; cls += " cellule-heros"; }
-      else if (ennemis.length > 0) { contenu = ennemis[0].estUnBoss ? "🐉" : "👹"; cls += " cellule-ennemi"; }
-      else if (objetSol) { contenu = objetSol.objet.type === "arme" ? "⚔️" : "🧪"; cls += " cellule-objet"; }
-      else if (type === "mur") { contenu = ""; }
-
-      gridHTML += `<div class="${cls}" style="width:${cellSize}px;height:${cellSize}px">${contenu}</div>`;
-    }
-    gridHTML += '</div>';
-  }
-  gridHTML += '</div>';
-
   const xpNecessaire = h.niveau * 50;
-  const pctPV = Math.round((h.pointsDeVie / h.pointsDeVieMax) * 100);
-  const pctXP = Math.round((h.xp / xpNecessaire) * 100);
+  const pctPV  = Math.round((h.pointsDeVie / h.pointsDeVieMax) * 100);
+  const pctXP  = Math.round((h.xp / xpNecessaire) * 100);
+  const W = jeu.carte.largeur * 48;
+  const H = jeu.carte.hauteur * 48;
 
   return `
     <div class="screen exploration-screen">
@@ -132,25 +115,32 @@ function renderExploration() {
         <div class="hud-right">
           <span class="lieu">📍 ${jeu.carte.nomLieu}</span>
           ${h.armeEquipee ? `<span class="arme-equipee">⚔️ ${h.armeEquipee.nom}</span>` : ""}
+          <span class="hud-controles">⬆⬇⬅➡ &nbsp;|&nbsp; [I] Inventaire &nbsp;|&nbsp; [M] Quêtes &nbsp;|&nbsp; [P] Pause</span>
         </div>
       </div>
 
       <div class="jeu-zone">
-        ${gridHTML}
+        <div class="canvas-wrapper">
+          <canvas id="canvas-carte" width="${W}" height="${H}"></canvas>
+        </div>
         <div class="panneau-lateral">
           <div class="log-zone">
-            <h4>Journal</h4>
-            ${jeu.log.slice(0, 8).map(l => `<p class="log-msg">${l}</p>`).join("")}
+            <h4>📋 Journal</h4>
+            ${jeu.log.slice(0, 10).map(l => `<p class="log-msg">${l}</p>`).join("")}
           </div>
-          <div class="controles-hint">
-            <p>⬆⬇⬅➡ Se déplacer</p>
-            <p>[I] Inventaire</p>
-            <p>[M] Carte/Quêtes</p>
-            <p>[P] Pause</p>
+          <div class="minimap-box">
+            <h4>🗺 Campus</h4>
+            <canvas id="canvas-mini" width="150" height="120"></canvas>
+          </div>
+          <div class="quete-hud">
+            ${jeu.heros.queteEnCours && !jeu.heros.queteEnCours.estAccomplie
+              ? `<p>🎯 <em>${jeu.heros.queteEnCours.description}</em></p>`
+              : '<p style="color:#666">Aucune quête active</p>'}
           </div>
         </div>
       </div>
     </div>`;
+
 }
 
 function renderCombat() {
@@ -308,6 +298,14 @@ function renderFin() {
 
 // ── Événements ─────────────────────────────────────────────────────────────────
 function bindEvents() {
+  // Lancer le canvas d'exploration
+  if (etat === "exploration") {
+    demarrerAnimation("canvas-carte", jeu);
+    dessinerMinimap();
+  } else {
+    stopperAnimation();
+  }
+
   // Sélection personnage
   document.querySelectorAll(".btn-choisir").forEach(btn => {
     btn.addEventListener("click", () => choisirPersonnage(parseInt(btn.dataset.index)));
@@ -549,6 +547,51 @@ function fuirCombat() {
   jeu.combatEnCours = false;
   etat = "exploration";
   render();
+}
+
+// ── Minimap ───────────────────────────────────────────────────────────────────
+function dessinerMinimap() {
+  const canvas = document.getElementById("canvas-mini");
+  if (!canvas || !jeu.carte) return;
+  const ctx = canvas.getContext("2d");
+  const W = canvas.width, H = canvas.height;
+  const tw = W / jeu.carte.largeur;
+  const th = H / jeu.carte.hauteur;
+  const grille = jeu.carte.afficher();
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = "#111";
+  ctx.fillRect(0, 0, W, H);
+
+  for (let y = 0; y < jeu.carte.hauteur; y++) {
+    for (let x = 0; x < jeu.carte.largeur; x++) {
+      const isHerbe = HERBE.some(h => h.x === x && h.y === y);
+      ctx.fillStyle = grille[y][x] === "mur" ? "#b0a898"
+                    : isHerbe ? "#4e7c42" : "#7a7060";
+      ctx.fillRect(x * tw + 1, y * th + 1, tw - 1, th - 1);
+    }
+  }
+
+  // Ennemis
+  jeu.carte.ennemis.filter(e => e.estVivant()).forEach(e => {
+    ctx.fillStyle = e.estUnBoss ? "#ff6600" : "#e03020";
+    ctx.fillRect(e.positionX * tw + 1, e.positionY * th + 1, tw - 1, th - 1);
+  });
+
+  // Objets
+  jeu.carte.objetsAuSol.forEach(o => {
+    ctx.fillStyle = o.objet.type === "arme" ? "#d4a820" : "#c030d0";
+    ctx.fillRect(o.x * tw + 1, o.y * th + 1, tw - 1, th - 1);
+  });
+
+  // Héros
+  ctx.fillStyle = "#40a0ff";
+  ctx.fillRect(jeu.heros.positionX * tw, jeu.heros.positionY * th, tw + 1, th + 1);
+
+  // Bordure
+  ctx.strokeStyle = "#555";
+  ctx.lineWidth = 1;
+  ctx.strokeRect(0, 0, W, H);
 }
 
 // ── Démarrage ─────────────────────────────────────────────────────────────────
