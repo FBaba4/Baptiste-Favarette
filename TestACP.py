@@ -18,8 +18,8 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
-from donnees import courbe_synthetique
-from acp_courbe import acp, _n_pour
+from Data import courbe_synthetique
+from ACP_courbe import acp, _n_pour
 
 
 @pytest.fixture(scope="module")

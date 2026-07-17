@@ -19,8 +19,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from donnees import courbe_synthetique, charger_fred
-from acp_courbe import acp
+from Data import courbe_synthetique, charger_fred
+from ACP_courbe import acp
 
 DOSSIER = Path(__file__).resolve().parent.parent / "figures"
 DOSSIER.mkdir(exist_ok=True)
