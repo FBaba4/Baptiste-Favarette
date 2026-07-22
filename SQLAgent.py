@@ -18,6 +18,7 @@ transmise précédemment.
 # SECTION 1 — Imports & configuration
 # ─────────────────────────────────────────────────────────────────────────
 import sqlite3
+import difflib
 from pathlib import Path
 import pandas as pd
 
@@ -28,13 +29,6 @@ from langchain.chat_models import init_chat_model
 from langchain.tools import tool
 from langchain.agents import create_agent
 
-# Outils des deux autres briques de MAF, ajoutés à ce même agent : requêtage
-# structuré (SQL), prédiction ML (predictor.py) et analyse technique de
-# cours boursier (TechnicalAnalysis.py) deviennent accessibles ensemble,
-# au lieu d'être cloisonnés dans des scripts séparés.
-from predictor import OUTILS_PREDICTION
-from TechnicalAnalysis import analyser_momentum_action
-
 DB_PATH = "maf.db"
 
 if not Path(DB_PATH).exists():
@@ -43,20 +37,13 @@ if not Path(DB_PATH).exists():
         f"pour générer la base à partir de donnees_structurees.csv."
     )
 
-# gemini-2.5-flash : cohérent avec le modèle utilisé ailleurs dans MAF
-# (DKMQuery.py) — plus coûteux que flash-lite, à surveiller si tu recroises
-# le quota gratuit comme précédemment.
+# gemini-3.1-flash-lite : cohérent avec le modèle utilisé ailleurs dans MAF.
 model = init_chat_model("google_genai:gemini-3.1-flash-lite")
 
 
 # ─────────────────────────────────────────────────────────────────────────
 # SECTION 2 — Accès à la base : connexion en lecture seule
 # ─────────────────────────────────────────────────────────────────────────
-# Le tutoriel officiel avertit explicitement : "scope database connection
-# permissions as narrowly as possible". On applique cette recommandation à
-# la lettre via le mode=ro de l'URI SQLite : même si le LLM générait une
-# requête DROP/DELETE par erreur, la connexion refuserait l'écriture au
-# niveau du système de fichiers — une protection indépendante du prompt.
 def _connexion_lecture_seule() -> sqlite3.Connection:
     return sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True)
 
@@ -64,11 +51,6 @@ def _connexion_lecture_seule() -> sqlite3.Connection:
 # ─────────────────────────────────────────────────────────────────────────
 # SECTION 3 — Outils SQL exposés au LLM
 # ─────────────────────────────────────────────────────────────────────────
-# Quatre outils minimalistes, dans l'esprit du tutoriel officiel : lister
-# les tables, lire un schéma, exécuter une requête, et vérifier une requête
-# avant exécution. Chacun ouvre/ferme sa propre connexion (léger, mais
-# évite tout risque de connexion partagée entre appels concurrents).
-
 @tool
 def sql_db_list_tables() -> str:
     """Input est une chaîne vide, output est la liste des tables de la base séparées par des virgules."""
@@ -264,23 +246,92 @@ def sql_db_valeurs_atypiques(colonne: str, secteur: str = "", seuil_zscore: floa
         con.close()
 
 
+def _resoudre_valeur_categorique(df: pd.DataFrame, colonne: str, valeur_saisie: str) -> tuple:
+    """
+    Résout une valeur saisie approximativement vers la valeur EXACTE présente
+    dans UNE colonne catégorielle donnée (ex. 'entreprise', 'secteur') —
+    SANS jamais halluciner : matching déterministe (difflib), aucune
+    génération LLM impliquée dans cette fonction.
+
+    Retourne (valeur_exacte, suggestions) :
+    - Correspondance forte et unique -> (valeur_exacte, [])
+    - Ambigu ou aucune correspondance suffisamment proche -> (None, [candidats])
+      Dans ce cas, l'outil appelant DOIT renvoyer les suggestions et refuser
+      de deviner — jamais filtrer/comparer sur une valeur non confirmée.
+    """
+    if colonne not in df.columns:
+        return None, []
+    valeurs_reelles = df[colonne].dropna().unique().tolist()
+    valeur_normalisee = valeur_saisie.strip().lower()
+
+    # 1. Correspondance exacte insensible à la casse — cas le plus fréquent
+    for valeur_reelle in valeurs_reelles:
+        if str(valeur_reelle).strip().lower() == valeur_normalisee:
+            return valeur_reelle, []
+
+    # 2. Correspondance par inclusion (ex. "bpce" contenu dans "Groupe BPCE",
+    #    ou "tech" contenu dans "Technology")
+    candidats_inclusion = [
+        v for v in valeurs_reelles
+        if valeur_normalisee in str(v).lower() or str(v).lower() in valeur_normalisee
+    ]
+    if len(candidats_inclusion) == 1:
+        return candidats_inclusion[0], []
+
+    # 3. Correspondance floue par distance d'édition (difflib, déterministe)
+    proches = difflib.get_close_matches(valeur_saisie, [str(v) for v in valeurs_reelles], n=3, cutoff=0.6)
+    if len(proches) == 1:
+        return proches[0], []
+
+    # Ambigu (plusieurs candidats à égalité) ou aucune correspondance fiable
+    # -> ne jamais deviner, remonter les candidats pour que l'humain/LLM
+    # demande confirmation plutôt que d'halluciner une réponse.
+    return None, (proches or candidats_inclusion)[:3]
+
+
+def _resoudre_nom_entreprise(df: pd.DataFrame, nom_saisi: str) -> tuple:
+    """Raccourci de _resoudre_valeur_categorique pour la colonne 'entreprise'
+    — conservé pour ne pas modifier les outils qui l'appellent déjà."""
+    return _resoudre_valeur_categorique(df, "entreprise", nom_saisi)
+
+
 @tool
 def sql_db_comparer_entreprises(entreprises: str, colonnes: str = "") -> str:
     """
     Compare plusieurs entreprises côte à côte sur les colonnes indiquées.
-    entreprises : noms séparés par des virgules (doivent correspondre exactement
-    à la colonne 'entreprise' — vérifie l'orthographe avec une requête si besoin).
+    entreprises : noms séparés par des virgules — pas besoin de l'orthographe
+    exacte, une reconnaissance approximative déterministe est appliquée
+    (ex. 'bpce' reconnaît 'Groupe BPCE'). Si un nom est ambigu, l'outil
+    liste des candidats plutôt que de deviner.
     colonnes : colonnes à comparer, séparées par des virgules. Si vide, utilise
     une sélection par défaut (secteur, marge nette, ROE, ROA, P/E, croissance CA).
     Exemple d'input : entreprises='Apple Inc.,Microsoft Corporation', colonnes=''"""
     con = _connexion_lecture_seule()
     try:
         df = pd.read_sql_query("SELECT * FROM entreprises", con)
-        noms = [n.strip() for n in entreprises.split(",") if n.strip()]
-        df_filtre = df[df["entreprise"].isin(noms)]
+        noms_saisis = [n.strip() for n in entreprises.split(",") if n.strip()]
 
-        if df_filtre.empty:
-            return f"Aucune entreprise trouvée pour : {entreprises}. Vérifie l'orthographe exacte (colonne 'entreprise')."
+        noms_resolus = []
+        avertissements = []
+        for nom_saisi in noms_saisis:
+            nom_resolu, suggestions = _resoudre_nom_entreprise(df, nom_saisi)
+            if nom_resolu is None:
+                if suggestions:
+                    avertissements.append(
+                        f"⚠️ '{nom_saisi}' : ambigu ou introuvable avec certitude — "
+                        f"candidats proches : {', '.join(suggestions)}. Précise laquelle."
+                    )
+                else:
+                    avertissements.append(f"⚠️ '{nom_saisi}' : aucune entreprise correspondante trouvée dans la base.")
+                continue
+            if nom_resolu.lower() != nom_saisi.lower():
+                avertissements.append(f"ℹ️ '{nom_saisi}' reconnu comme '{nom_resolu}'.")
+            noms_resolus.append(nom_resolu)
+
+        if not noms_resolus:
+            return "Aucune entreprise résolue avec certitude.\n" + "\n".join(avertissements)
+
+        df_filtre = df[df["entreprise"].isin(noms_resolus)]
 
         if colonnes.strip():
             cols_demandees = [c.strip() for c in colonnes.split(",")]
@@ -296,9 +347,7 @@ def sql_db_comparer_entreprises(entreprises: str, colonnes: str = "") -> str:
             cols_valides = [c for c in candidats_defaut if c in df.columns]
 
         tableau = df_filtre[["entreprise"] + cols_valides].to_string(index=False)
-        entreprises_trouvees = df_filtre["entreprise"].tolist()
-        manquantes_noms = set(noms) - set(entreprises_trouvees)
-        note = f"\n⚠️ Non trouvées : {', '.join(manquantes_noms)}" if manquantes_noms else ""
+        note = ("\n" + "\n".join(avertissements)) if avertissements else ""
         return f"Comparaison de {len(df_filtre)} entreprise(s) :\n\n{tableau}{note}"
     except Exception as e:
         return f"Erreur : {e}"
@@ -318,7 +367,11 @@ def sql_db_score_risque(entreprise: str) -> str:
     ⚠️ CE N'EST PAS UN MODÈLE STATISTIQUE ENTRAÎNÉ (contrairement aux outils
     predict_*) — c'est une formule pondérée choisie arbitrairement (40%
     liquidité, 35% endettement, 25% beta), à présenter comme une méthode
-    transparente et assumée, jamais comme une prédiction validée."""
+    transparente et assumée, jamais comme une prédiction validée.
+
+    Le nom d'entreprise n'a pas besoin d'être exact — une reconnaissance
+    approximative déterministe est appliquée. Si le nom est ambigu, l'outil
+    refuse de deviner et liste des candidats."""
     con = _connexion_lecture_seule()
     try:
         df = pd.read_sql_query("SELECT * FROM entreprises", con)
@@ -328,10 +381,23 @@ def sql_db_score_risque(entreprise: str) -> str:
         if manquantes:
             return f"Colonnes manquantes pour ce calcul : {manquantes}. Vérifie le schéma avec sql_db_schema."
 
-        ligne = df[df["entreprise"] == entreprise]
-        if ligne.empty:
-            return f"Entreprise '{entreprise}' introuvable. Vérifie l'orthographe exacte."
-        ligne = ligne.iloc[0]
+        nom_resolu, suggestions = _resoudre_nom_entreprise(df, entreprise)
+        if nom_resolu is None:
+            if suggestions:
+                return (
+                    f"Entreprise '{entreprise}' ambiguë ou non trouvée avec certitude — "
+                    f"candidats proches : {', '.join(suggestions)}. Précise laquelle plutôt "
+                    f"que de deviner."
+                )
+            return f"Entreprise '{entreprise}' introuvable dans la base."
+
+        note_reconnaissance = (
+            f"(reconnu comme '{nom_resolu}' à partir de '{entreprise}')\n"
+            if nom_resolu.lower() != entreprise.strip().lower() else ""
+        )
+
+        ligne = df[df["entreprise"] == nom_resolu].iloc[0]
+        entreprise = nom_resolu  # pour que le reste de la fonction utilise le nom exact
 
         def _nettoyer(valeur):
             return pd.to_numeric(str(valeur).replace("%", "").replace(",", "."), errors="coerce")
@@ -352,14 +418,13 @@ def sql_db_score_risque(entreprise: str) -> str:
                 errors="coerce",
             ).dropna()
             if serie.empty:
-                return 50.0  # valeur neutre si le panel n'a aucune donnée exploitable
+                return 50.0
             return (serie < valeur).mean() * 100
 
         pct_liquidite = _percentile_dans_panel("ratio_liquidite_generale", liquidite)
         pct_endettement = _percentile_dans_panel("ratio_dette_capital_pct", endettement)
         pct_beta = _percentile_dans_panel("beta", beta)
 
-        # Liquidité inversée : un percentile élevé de liquidité = MOINS risqué.
         score_risque = 0.40 * (100 - pct_liquidite) + 0.35 * pct_endettement + 0.25 * pct_beta
 
         if score_risque < 33:
@@ -370,6 +435,7 @@ def sql_db_score_risque(entreprise: str) -> str:
             niveau = "Élevé"
 
         return (
+            f"{note_reconnaissance}"
             f"Score de risque composite pour {entreprise} : {score_risque:.0f}/100 — Risque {niveau}\n"
             f"Détail (percentile dans le panel, 0=meilleur, 100=pire) :\n"
             f"- Liquidité : {liquidite} (percentile {pct_liquidite:.0f}, pondération 40%)\n"
@@ -383,48 +449,490 @@ def sql_db_score_risque(entreprise: str) -> str:
         con.close()
 
 
+@tool
+def sql_db_screener(
+    secteur: str = "",
+    roe_min: float = None,
+    roe_max: float = None,
+    roa_min: float = None,
+    marge_nette_min: float = None,
+    dette_capital_max: float = None,
+    pe_max: float = None,
+    croissance_ca_min: float = None,
+    beta_max: float = None,
+    limite: int = 20,
+) -> str:
+    """
+    Filtre le panel d'entreprises selon PLUSIEURS critères financiers
+    combinés (ET logique), pour DÉCOUVRIR des candidats correspondant à un
+    profil — à l'inverse de sql_db_comparer_entreprises ou
+    sql_db_score_risque qui exigent de connaître déjà les noms des
+    entreprises à examiner.
+
+    Tous les critères sont optionnels et cumulatifs. Le secteur n'a pas
+    besoin d'être exact — une reconnaissance approximative déterministe est
+    appliquée (ex. 'tech' reconnaît 'Technology'), avec refus explicite si
+    ambigu plutôt que de deviner. Exemple d'usage : "entreprises du secteur
+    Technology avec un ROE > 20% et un endettement < 100%" ->
+    secteur='Technology', roe_min=20, dette_capital_max=100.
+    limite (défaut 20) plafonne le nombre de lignes affichées, PAS le
+    nombre total trouvé (indiqué séparément si supérieur à la limite)."""
+    con = _connexion_lecture_seule()
+    try:
+        df = pd.read_sql_query("SELECT * FROM entreprises", con)
+
+        def _numerique(colonne):
+            return pd.to_numeric(
+                df[colonne].astype(str).str.replace("%", "", regex=False).str.replace(",", ".", regex=False),
+                errors="coerce",
+            )
+
+        masque = pd.Series(True, index=df.index)
+        criteres_appliques = []
+
+        if secteur:
+            if "secteur" not in df.columns:
+                return "Erreur : colonne 'secteur' introuvable. Vérifie le schéma avec sql_db_schema."
+            secteur_resolu, suggestions = _resoudre_valeur_categorique(df, "secteur", secteur)
+            if secteur_resolu is None:
+                if suggestions:
+                    return (
+                        f"Secteur '{secteur}' ambigu ou non reconnu avec certitude — "
+                        f"secteurs proches dans la base : {', '.join(suggestions)}. "
+                        f"Précise lequel plutôt que de deviner."
+                    )
+                return f"Secteur '{secteur}' introuvable dans la base."
+            masque &= (df["secteur"] == secteur_resolu)
+            note_secteur = f" (reconnu comme '{secteur_resolu}')" if secteur_resolu.lower() != secteur.strip().lower() else ""
+            criteres_appliques.append(f"secteur = '{secteur_resolu}'{note_secteur}")
+
+        # (colonne réelle, valeur du paramètre, nom du paramètre, opérateur)
+        # — colonnes réutilisées telles quelles depuis sql_db_comparer_entreprises
+        # et sql_db_score_risque, déjà confirmées fonctionnelles dans ce fichier.
+        criteres_numeriques = [
+            ("rentabilite_capitaux_roe", roe_min, "roe_min", ">="),
+            ("rentabilite_capitaux_roe", roe_max, "roe_max", "<="),
+            ("rentabilite_actifs_roa", roa_min, "roa_min", ">="),
+            ("marge_nette_pct", marge_nette_min, "marge_nette_min", ">="),
+            ("ratio_dette_capital_pct", dette_capital_max, "dette_capital_max", "<="),
+            ("p_e_ratio_valorisation", pe_max, "pe_max", "<="),
+            ("croissance_ca_pct", croissance_ca_min, "croissance_ca_min", ">="),
+            ("beta", beta_max, "beta_max", "<="),
+        ]
+
+        for colonne, valeur, nom_param, operateur in criteres_numeriques:
+            if valeur is None:
+                continue
+            if colonne not in df.columns:
+                return f"Erreur : colonne '{colonne}' introuvable pour {nom_param}. Vérifie le schéma avec sql_db_schema."
+            serie = _numerique(colonne)
+            masque &= (serie >= valeur) if operateur == ">=" else (serie <= valeur)
+            criteres_appliques.append(f"{nom_param} ({colonne} {operateur} {valeur})")
+
+        if not criteres_appliques:
+            return "Aucun critère fourni — précise au moins un filtre (secteur, roe_min, dette_capital_max, ...)."
+
+        resultat = df[masque]
+        if resultat.empty:
+            return f"Aucune entreprise ne correspond aux critères : {', '.join(criteres_appliques)}."
+
+        colonnes_affichage = [
+            "entreprise", "secteur", "rentabilite_capitaux_roe", "rentabilite_actifs_roa",
+            "marge_nette_pct", "ratio_dette_capital_pct", "p_e_ratio_valorisation",
+            "croissance_ca_pct", "beta",
+        ]
+        colonnes_dispo = [c for c in colonnes_affichage if c in resultat.columns]
+        tableau = resultat[colonnes_dispo].head(limite).to_string(index=False)
+
+        note_limite = ""
+        if len(resultat) > limite:
+            note_limite = f"\n⚠️ {len(resultat)} entreprise(s) trouvée(s) au total — affichage limité aux {limite} premières."
+
+        return (
+            f"{len(resultat)} entreprise(s) correspondant aux critères ({', '.join(criteres_appliques)}) :\n\n"
+            f"{tableau}{note_limite}"
+        )
+    except Exception as e:
+        return f"Erreur : {e}"
+    finally:
+        con.close()
+
+
+def _trouver_colonne(df: pd.DataFrame, candidats: list) -> str | None:
+    """
+    Retourne le premier nom de colonne parmi plusieurs variantes plausibles
+    qui existe réellement dans df — utilisé pour les colonnes dont le nom
+    SQL exact n'a jamais été confirmé dans le code (contrairement à
+    'rentabilite_capitaux_roe', 'beta', etc. déjà utilisés ailleurs dans ce
+    fichier). Évite de deviner un nom de colonne et de planter ou, pire,
+    d'ignorer silencieusement un contrôle censé s'exécuter.
+    """
+    for candidat in candidats:
+        if candidat in df.columns:
+            return candidat
+    return None
+
+
+def _numerique_serie(serie: pd.Series) -> pd.Series:
+    return pd.to_numeric(
+        serie.astype(str).str.replace("%", "", regex=False).str.replace(",", ".", regex=False),
+        errors="coerce",
+    )
+
+
+def _controler_une_ligne(ligne: pd.Series, colonnes: dict) -> list:
+    """
+    Applique les contrôles de cohérence à UNE ligne (une entreprise) et
+    retourne la liste des violations trouvées, chacune taguée
+    'incohérence mathématique' (théoriquement impossible en comptabilité
+    standard) ou 'anomalie à vérifier' (statistiquement suspect, mais pas
+    strictement impossible — peut arriver sur des cas réels particuliers).
+    """
+    violations = []
+
+    def _val(cle):
+        col = colonnes.get(cle)
+        if col is None or pd.isna(ligne.get(col)):
+            return None
+        return _numerique_serie(pd.Series([ligne[col]])).iloc[0]
+
+    mb, mo, meb, mn = _val("marge_brute"), _val("marge_operationnelle"), _val("marge_ebitda"), _val("marge_nette")
+
+    # Hiérarchie standard des marges : brute >= EBITDA >= opérationnelle >= nette.
+    # Peut être violée par des éléments exceptionnels non récurrents (cessions,
+    # dépréciations) — donc "à vérifier", pas "impossible à 100%", sauf le
+    # premier cas (nette > brute) qui est structurellement impossible.
+    if mb is not None and mn is not None and mn > mb:
+        violations.append(("incohérence mathématique", f"Marge nette ({mn}%) > Marge brute ({mb}%) — structurellement impossible : la marge nette ne peut pas dépasser la marge brute."))
+    if mb is not None and meb is not None and meb > mb + 1:  # tolérance 1pt pour arrondis
+        violations.append(("anomalie à vérifier", f"Marge EBITDA ({meb}%) > Marge brute ({mb}%) — inhabituel, à vérifier (données possiblement mal renseignées)."))
+    if meb is not None and mo is not None and mo > meb + 1:
+        violations.append(("anomalie à vérifier", f"Marge opérationnelle ({mo}%) > Marge EBITDA ({meb}%) — inhabituel : l'EBITDA est normalement calculé avant D&A, donc >= marge opérationnelle."))
+
+    prix, haut52, bas52 = _val("prix_actuel"), _val("plus_haut_52_sem"), _val("plus_bas_52_sem")
+    if haut52 is not None and bas52 is not None and haut52 < bas52:
+        violations.append(("incohérence mathématique", f"Plus haut 52 sem. ({haut52}) < Plus bas 52 sem. ({bas52}) — impossible par définition."))
+    if prix is not None and haut52 is not None and prix > haut52 * 1.02:  # tolérance 2% (données pas forcément synchrones)
+        violations.append(("anomalie à vérifier", f"Prix actuel ({prix}) > Plus haut 52 sem. ({haut52}) — données probablement désynchronisées dans le temps."))
+    if prix is not None and bas52 is not None and prix < bas52 * 0.98:
+        violations.append(("anomalie à vérifier", f"Prix actuel ({prix}) < Plus bas 52 sem. ({bas52}) — données probablement désynchronisées dans le temps."))
+
+    beta = _val("beta")
+    if beta is not None and abs(beta) > 5:
+        violations.append(("anomalie à vérifier", f"Beta extrême ({beta}) — valeur rare, à vérifier avant de s'y fier."))
+
+    return violations
+
+
+@tool
+def sql_db_controle_coherence(entreprise: str = "") -> str:
+    """
+    Vérifie la cohérence mathématique/logique interne des données d'une
+    entreprise (ou de tout le panel si entreprise est vide) — complète
+    sql_db_valeurs_atypiques (qui détecte des valeurs statistiquement
+    inhabituelles) en détectant des INCOHÉRENCES LOGIQUES (ex. marge nette
+    supérieure à la marge brute, ce qui est structurellement impossible),
+    signe probable d'une donnée mal renseignée plutôt que d'une performance
+    exceptionnelle réelle.
+
+    Si entreprise est fourni, reconnaissance approximative du nom appliquée
+    (comme les autres outils). Si vide, scanne tout le panel et liste les
+    entreprises présentant au moins une incohérence.
+
+    ⚠️ Certains contrôles portent sur des colonnes dont le nom SQL exact
+    n'est pas garanti (marges opérationnelle/EBITDA, prix 52 semaines) — si
+    une colonne attendue est introuvable, le contrôle correspondant est
+    simplement ignoré (signalé explicitement), pas simulé ni deviné."""
+    con = _connexion_lecture_seule()
+    try:
+        df = pd.read_sql_query("SELECT * FROM entreprises", con)
+
+        colonnes = {
+            "marge_brute": _trouver_colonne(df, ["marge_brute_pct", "marge_brute"]),
+            "marge_operationnelle": _trouver_colonne(df, ["marge_operationnelle_pct", "marge_operationnelle"]),
+            "marge_ebitda": _trouver_colonne(df, ["marge_ebitda_pct", "marge_ebitda"]),
+            "marge_nette": _trouver_colonne(df, ["marge_nette_pct", "marge_nette"]),
+            "prix_actuel": _trouver_colonne(df, ["prix_actuel"]),
+            "plus_haut_52_sem": _trouver_colonne(df, ["plus_haut_52_sem", "plus_haut_52_sem_", "plus_haut_52sem"]),
+            "plus_bas_52_sem": _trouver_colonne(df, ["plus_bas_52_sem", "plus_bas_52_sem_", "plus_bas_52sem"]),
+            "beta": _trouver_colonne(df, ["beta"]),
+        }
+        colonnes_manquantes = [cle for cle, col in colonnes.items() if col is None]
+        note_colonnes = (
+            f"⚠️ Colonnes non trouvées, contrôles correspondants ignorés : {', '.join(colonnes_manquantes)}.\n\n"
+            if colonnes_manquantes else ""
+        )
+
+        if entreprise:
+            nom_resolu, suggestions = _resoudre_nom_entreprise(df, entreprise)
+            if nom_resolu is None:
+                if suggestions:
+                    return f"Entreprise '{entreprise}' ambiguë ou non trouvée — candidats : {', '.join(suggestions)}."
+                return f"Entreprise '{entreprise}' introuvable dans la base."
+
+            ligne = df[df["entreprise"] == nom_resolu].iloc[0]
+            violations = _controler_une_ligne(ligne, colonnes)
+
+            if not violations:
+                return f"{note_colonnes}✅ Aucune incohérence détectée pour {nom_resolu}."
+
+            lignes_sortie = [f"{note_colonnes}⚠️ {len(violations)} problème(s) détecté(s) pour {nom_resolu} :"]
+            for categorie, message in violations:
+                lignes_sortie.append(f"  [{categorie}] {message}")
+            return "\n".join(lignes_sortie)
+
+        # Mode scan complet du panel
+        resultats_par_entreprise = {}
+        for _, ligne in df.iterrows():
+            violations = _controler_une_ligne(ligne, colonnes)
+            if violations:
+                resultats_par_entreprise[ligne.get("entreprise", "?")] = violations
+
+        if not resultats_par_entreprise:
+            return f"{note_colonnes}✅ Aucune incohérence détectée sur les {len(df)} entreprises du panel."
+
+        lignes_sortie = [
+            f"{note_colonnes}⚠️ {len(resultats_par_entreprise)} entreprise(s) sur {len(df)} "
+            f"présentent au moins une incohérence :"
+        ]
+        for nom, violations in list(resultats_par_entreprise.items())[:15]:
+            resume = "; ".join(f"[{c}] {m}" for c, m in violations)
+            lignes_sortie.append(f"  - {nom} : {resume}")
+        if len(resultats_par_entreprise) > 15:
+            lignes_sortie.append(f"  ... et {len(resultats_par_entreprise) - 15} autre(s), non affichée(s).")
+
+        return "\n".join(lignes_sortie)
+    except Exception as e:
+        return f"Erreur : {e}"
+    finally:
+        con.close()
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# TOOLS — purement SQL désormais. La prédiction ML et l'analyse technique
+# ont leur propre agent dédié dans Monitor.py (agent_estimation,
+# agent_technique) — les regrouper ici créait un chevauchement : une
+# prédiction ML appelée via cet agent aurait été étiquetée à tort comme
+# "donnée réelle en base" par l'orchestrateur, qui juge uniquement par le
+# NOM de l'agent sollicité (agent_base_donnees), pas par l'outil interne
+# réellement utilisé.
+# ─────────────────────────────────────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────
+# Fonction pour l'interface visuelle (radar chart) — PAS un outil LLM,
+# appelée directement par App.py. Calcul 100% SQL/pandas, aucun texte
+# généré par un modèle de langage : les valeurs affichées dans le radar
+# sont garanties exactes (ou absentes), jamais reformulées/résumées par un LLM.
+# ─────────────────────────────────────────────────────────────────────────
+AXES_RADAR = [
+    ("rentabilite_capitaux_roe", "ROE"),
+    ("rentabilite_actifs_roa", "ROA"),
+    ("marge_brute_pct", "Marge brute"),
+    ("marge_nette_pct", "Marge nette"),
+    ("croissance_ca_pct", "Croissance CA"),
+]
+
+
+def donnees_radar_entreprise(nom_entreprise: str) -> dict | None:
+    """
+    Calcule les valeurs (entreprise vs moyenne du secteur) pour un radar
+    chart de 5 ratios de rentabilité, tous en pourcentage donc comparables
+    sur une même échelle. Retourne None si l'entreprise n'est pas résolue
+    avec certitude (jamais de radar sur une entreprise devinée).
+
+    Retourne un dict :
+    {
+        "entreprise": nom exact résolu,
+        "secteur": secteur de l'entreprise,
+        "labels": [noms d'axes affichés],
+        "valeurs_entreprise": [valeurs, NaN si donnée absente],
+        "valeurs_secteur": [moyennes sectorielles, NaN si non calculables],
+        "colonnes_manquantes": [colonnes attendues absentes de la base],
+    }
+    """
+    con = _connexion_lecture_seule()
+    try:
+        df = pd.read_sql_query("SELECT * FROM entreprises", con)
+
+        nom_resolu, _ = _resoudre_nom_entreprise(df, nom_entreprise)
+        if nom_resolu is None:
+            return None
+
+        ligne = df[df["entreprise"] == nom_resolu].iloc[0]
+        secteur = ligne.get("secteur", None)
+        df_secteur = df[df["secteur"] == secteur] if secteur is not None and "secteur" in df.columns else df
+
+        labels, valeurs_entreprise, valeurs_secteur, colonnes_manquantes = [], [], [], []
+
+        for colonne, label in AXES_RADAR:
+            if colonne not in df.columns:
+                colonnes_manquantes.append(colonne)
+                continue
+            labels.append(label)
+
+            v_entreprise = _numerique_serie(pd.Series([ligne[colonne]])).iloc[0]
+            valeurs_entreprise.append(v_entreprise)
+
+            v_secteur = _numerique_serie(df_secteur[colonne]).mean()
+            valeurs_secteur.append(v_secteur)
+
+        return {
+            "entreprise": nom_resolu,
+            "secteur": secteur,
+            "labels": labels,
+            "valeurs_entreprise": valeurs_entreprise,
+            "valeurs_secteur": valeurs_secteur,
+            "colonnes_manquantes": colonnes_manquantes,
+        }
+    except Exception:
+        return None
+    finally:
+        con.close()
+
+
+def donnees_score_risque_graphique(entreprise: str) -> dict | None:
+    """
+    Version 'données structurées' de sql_db_score_risque, pour affichage en
+    camembert (composition pondérée 40/35/25%) plutôt qu'en texte. Réutilise
+    EXACTEMENT le même calcul que l'outil texte — aucune divergence possible
+    entre ce que l'agent dit et ce que le graphique montre.
+    """
+    con = _connexion_lecture_seule()
+    try:
+        df = pd.read_sql_query("SELECT * FROM entreprises", con)
+        colonnes_requises = ["entreprise", "ratio_liquidite_generale", "ratio_dette_capital_pct", "beta"]
+        if any(c not in df.columns for c in colonnes_requises):
+            return None
+
+        nom_resolu, _ = _resoudre_nom_entreprise(df, entreprise)
+        if nom_resolu is None:
+            return None
+
+        ligne = df[df["entreprise"] == nom_resolu].iloc[0]
+
+        def _nettoyer(v):
+            return pd.to_numeric(str(v).replace("%", "").replace(",", "."), errors="coerce")
+
+        liquidite, endettement, beta = (
+            _nettoyer(ligne["ratio_liquidite_generale"]),
+            _nettoyer(ligne["ratio_dette_capital_pct"]),
+            _nettoyer(ligne["beta"]),
+        )
+        if pd.isna(liquidite) or pd.isna(endettement) or pd.isna(beta):
+            return None
+
+        def _percentile(colonne, valeur):
+            serie = _numerique_serie(df[colonne]).dropna()
+            return 50.0 if serie.empty else (serie < valeur).mean() * 100
+
+        pct_liquidite = _percentile("ratio_liquidite_generale", liquidite)
+        pct_endettement = _percentile("ratio_dette_capital_pct", endettement)
+        pct_beta = _percentile("beta", beta)
+
+        contributions = {
+            "Liquidité (pondération 40%)": 0.40 * (100 - pct_liquidite),
+            "Endettement (pondération 35%)": 0.35 * pct_endettement,
+            "Beta (pondération 25%)": 0.25 * pct_beta,
+        }
+
+        return {
+            "entreprise": nom_resolu,
+            "score_total": sum(contributions.values()),
+            "contributions": contributions,
+        }
+    except Exception:
+        return None
+    finally:
+        con.close()
+
+
+def donnees_comparaison_graphique(entreprises: list, colonnes: list = None) -> dict | None:
+    """
+    Version 'données structurées' de sql_db_comparer_entreprises, pour
+    affichage en diagramme en bâtons groupés plutôt qu'en tableau texte.
+    """
+    con = _connexion_lecture_seule()
+    try:
+        df = pd.read_sql_query("SELECT * FROM entreprises", con)
+
+        noms_resolus = []
+        for nom in entreprises:
+            resolu, _ = _resoudre_nom_entreprise(df, nom)
+            if resolu and resolu not in noms_resolus:
+                noms_resolus.append(resolu)
+        if not noms_resolus:
+            return None
+
+        if not colonnes:
+            colonnes = ["marge_nette_pct", "rentabilite_capitaux_roe", "rentabilite_actifs_roa", "croissance_ca_pct"]
+        colonnes_dispo = [c for c in colonnes if c in df.columns]
+        if not colonnes_dispo:
+            return None
+
+        df_filtre = df[df["entreprise"].isin(noms_resolus)]
+        valeurs = {
+            colonne: {
+                row["entreprise"]: _numerique_serie(pd.Series([row[colonne]])).iloc[0]
+                for _, row in df_filtre.iterrows()
+            }
+            for colonne in colonnes_dispo
+        }
+
+        return {"entreprises": noms_resolus, "colonnes": colonnes_dispo, "valeurs": valeurs}
+    except Exception:
+        return None
+    finally:
+        con.close()
+
+
 TOOLS = [
     sql_db_list_tables, sql_db_schema, sql_db_query, sql_db_query_checker,
     sql_db_statistiques, sql_db_valeurs_atypiques,
-    sql_db_comparer_entreprises, sql_db_score_risque,
-] + OUTILS_PREDICTION + [analyser_momentum_action]
+    sql_db_comparer_entreprises, sql_db_score_risque, sql_db_screener,
+    sql_db_controle_coherence,
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# SECTION 4 — System prompt de l'agent
+# SECTION 4 — System prompt de l'agent (recentré sur le SQL uniquement)
 # ─────────────────────────────────────────────────────────────────────────
 SYSTEM_PROMPT = """
-Tu es l'agent d'analyse de MAF (Mon Analyseur Financier). Tu as accès à
-quatre familles d'outils, à ne jamais confondre :
+Tu es l'agent base de données de MAF (Mon Analyseur Financier). Tu
+interroges exclusivement une base SQLite de données réelles collectées sur
+~180 entreprises (secteur, marges, ratios...).
 
-1. OUTILS SQL (sql_db_*) : interrogent une base SQLite de données réelles
-   collectées sur ~180 entreprises (secteur, marges, ratios...). Utilise
-   sql_db_statistiques et sql_db_valeurs_atypiques pour contextualiser un
-   chiffre, sql_db_comparer_entreprises pour une comparaison côte à côte.
+Utilise sql_db_statistiques et sql_db_valeurs_atypiques pour contextualiser
+un chiffre, sql_db_comparer_entreprises pour une comparaison côte à côte.
 
-2. SCORE DE RISQUE (sql_db_score_risque) : une FORMULE PONDÉRÉE EXPLICITE
-   (liquidité, endettement, beta), PAS un modèle statistique entraîné.
-   Toujours présenter ce score en précisant que c'est une méthode de
-   scoring transparente et arbitraire, pas une prédiction validée.
+sql_db_screener sert à DÉCOUVRIR des entreprises correspondant à un profil
+(plusieurs critères combinés : secteur, ROE min, endettement max...) —
+utilise-le quand l'utilisateur cherche des candidats plutôt que de vérifier
+des entreprises déjà nommées.
 
-3. OUTILS DE PRÉDICTION (predict_*) : des modèles Random Forest entraînés
-   sur le panel, qui ESTIMENT un indicateur à partir de trois paramètres
-   d'entrée (chiffre d'affaires, bénéfice net, marge brute). À utiliser
-   seulement pour une estimation à partir de paramètres hypothétiques.
+sql_db_controle_coherence détecte des INCOHÉRENCES LOGIQUES dans les
+données (ex. marge nette > marge brute, structurellement impossible) —
+différent de sql_db_valeurs_atypiques qui détecte des valeurs juste
+inhabituelles statistiquement. Utilise-le si l'utilisateur doute de la
+fiabilité d'une donnée, ou avant de t'appuyer fortement sur les chiffres
+d'une entreprise pour une analyse importante.
 
-4. ANALYSE TECHNIQUE (analyser_momentum_action) : indicateur descriptif de
-   tendance de cours boursier, non validé statistiquement.
-
-RÈGLE DE FOND : ne mélange jamais silencieusement ces quatre types de
-résultats. Si tu combines plusieurs sources, précise explicitement laquelle
-est laquelle et son statut (fait vérifié / formule transparente / modèle
-statistique / indicateur descriptif).
+sql_db_score_risque est une FORMULE PONDÉRÉE EXPLICITE (liquidité,
+endettement, beta), PAS un modèle statistique entraîné. Précise toujours
+que c'est une méthode de scoring transparente et arbitraire, pas une
+prédiction validée.
 
 Pour toute requête SQL : génère une requête SQLite correcte, vérifie-la
 avec sql_db_query_checker AVANT de l'exécuter, limite à 10 résultats sauf
 demande contraire, ne sélectionne que les colonnes utiles. Commence
 TOUJOURS par sql_db_list_tables puis sql_db_schema avant d'écrire une
 requête — ne saute jamais cette étape.
+
+RECONNAISSANCE DE NOMS D'ENTREPRISE : sql_db_comparer_entreprises et
+sql_db_score_risque reconnaissent les noms approximatifs automatiquement
+(ex. "bpce" -> "Groupe BPCE") — transmets le nom tel que l'utilisateur l'a
+écrit, sans essayer de le corriger toi-même au préalable. Si l'outil renvoie
+un message d'ambiguïté avec des candidats, REPRODUIS ces candidats à
+l'utilisateur et demande-lui de préciser — ne choisis JAMAIS un candidat à
+sa place, ce serait halluciner une correspondance non confirmée.
 
 ANALYSE, NE TE CONTENTE PAS DE RESTITUER : un chiffre brut n'a de valeur
 analytique que comparé à quelque chose. Termine si possible par une phrase
@@ -433,6 +941,9 @@ d'interprétation, pas seulement le chiffre.
 INTERDICTION ABSOLUE d'exécuter des requêtes INSERT, UPDATE, DELETE, DROP
 ou toute autre modification de la base (accès de toute façon en lecture
 seule, mais ne tente même pas).
+
+Tu ne fais NI prédiction statistique NI analyse technique de cours boursier
+— si on te demande ça, dis que ce n'est pas ton rôle plutôt que d'improviser.
 """
 
 agent = create_agent(model, TOOLS, system_prompt=SYSTEM_PROMPT)
@@ -443,9 +954,7 @@ def extraire_texte(contenu) -> str:
     Le champ .content d'un message peut être soit une chaîne simple, soit
     une liste de blocs structurés — certaines versions du SDK Gemini
     renvoient [{'type': 'text', 'text': '...', 'extras': {'signature': ...}}]
-    plutôt qu'une chaîne brute (la signature sert à la vérification interne
-    des appels d'outils par Google, aucun intérêt pour l'affichage).
-    On ne garde que le texte réellement utile.
+    plutôt qu'une chaîne brute. On ne garde que le texte réellement utile.
     """
     if isinstance(contenu, str):
         return contenu
@@ -463,13 +972,6 @@ def extraire_texte(contenu) -> str:
 # ─────────────────────────────────────────────────────────────────────────
 # SECTION 5 — Boucle de test en CLI
 # ─────────────────────────────────────────────────────────────────────────
-# Interface volontairement alignée sur celle de DKMQuery.py (👤 Vous / 💡 IA)
-# pour rester cohérente dans tout le projet. On utilise agent.invoke() plutôt
-# que agent.stream() : on ne veut que la réponse finale, pas le détail de
-# chaque étape (appels d'outils, requêtes intermédiaires) affiché à l'écran.
-#
-# DEBUG=True réaffiche le détail complet (utile pour comprendre pourquoi une
-# requête a échoué) sans revenir au code précédent.
 DEBUG = False
 
 if __name__ == "__main__":
@@ -477,7 +979,7 @@ if __name__ == "__main__":
     print(f"\n🗄️  Agent prêt ! Base active : {DB_PATH} (lecture seule)")
     print("💾 Mémoire de session activée. Tapez 'exit' pour quitter.\n", flush=True)
 
-    messages = []  # historique complet (avec appels d'outils) pour le contexte de l'agent
+    messages = []
 
     while True:
         try:
@@ -498,7 +1000,7 @@ if __name__ == "__main__":
             else:
                 result = agent.invoke({"messages": messages})
 
-            messages = result["messages"]  # on garde tout pour le tour suivant (contexte de l'agent)
+            messages = result["messages"]
             reponse = extraire_texte(messages[-1].content)
             print(f"\n💡 IA :\n{reponse}", flush=True)
 
@@ -507,25 +1009,3 @@ if __name__ == "__main__":
             break
         except Exception as e:
             print(f"\n❌ Erreur : {e}", flush=True)
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# SECTION 6 (référence, non activée) — Contrôle humain avant exécution SQL
-# ─────────────────────────────────────────────────────────────────────────
-# La doc officielle propose un middleware human-in-the-loop qui met en
-# pause l'agent avant chaque sql_db_query, pour validation manuelle — utile
-# pour un vrai outil d'audit, mais ajoute de la complexité (checkpointer,
-# reprise via Command). Pas activé par défaut ici ; à réintroduire plus tard
-# si tu veux cette garantie supplémentaire :
-#
-#   from langchain.agents.middleware import HumanInTheLoopMiddleware
-#   from langgraph.checkpoint.memory import InMemorySaver
-#
-#   agent = create_agent(
-#       model, TOOLS, system_prompt=SYSTEM_PROMPT,
-#       middleware=[HumanInTheLoopMiddleware(
-#           interrupt_on={"sql_db_query": True},
-#           description_prefix="Requête en attente de validation",
-#       )],
-#       checkpointer=InMemorySaver(),
-#   )

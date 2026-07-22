@@ -25,7 +25,7 @@ INDEXES_DIR.mkdir(exist_ok=True)
 # chaque chunk : le temps d'ingestion devient quasi proportionnel au nombre
 # de batchs, pas au nombre de chunks.
 
-BATCH_SIZE = 48         # nombre de chunks envoyés par appel API
+BATCH_SIZE = 48         # nombre de chunks envoyés par appel API                
 PAUSE_ENTRE_BATCHS = 30 # secondes, marge de sécurité anti-quota entre batchs
 _embeddings = None  # variable globale pour stocker l'instance d'embeddings
 
