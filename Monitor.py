@@ -79,7 +79,12 @@ agent_technique = create_agent(model, [analyser_momentum_action], system_prompt=
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# Agent spécialiste "document" — dynamique
+# Agent spécialiste "document" — MULTI-DOCUMENTS : un outil de recherche
+# distinct par document (pas un seul outil générique), pour qu'une même
+# conversation liée à une entreprise puisse naviguer entre plusieurs
+# rapports (annuel 2025, T2 2026...) sans qu'on précise lequel — l'agent
+# choisit le(s) bon(s) outil(s) d'après leur nom/description, et peut en
+# appeler plusieurs dans le même tour pour une comparaison.
 # ─────────────────────────────────────────────────────────────────────────
 _embeddings_rag = None
 
@@ -94,32 +99,83 @@ class ArgsRecherche(BaseModel):
     requete: str = Field(description="Ce que tu cherches dans le document (mots-clés ou question précise)")
 
 
-def _construire_agent_document(index_name: str):
-    embeddings = _get_embeddings()
-    vector_store = FAISS.load_local(
-        str(INDEXES_DIR / index_name), embeddings, allow_dangerous_deserialization=True
-    )
-    retriever = vector_store.as_retriever(search_kwargs={"k": 5})
+_retrievers_documents_cache: dict = {}
+
+
+def _get_retriever_document(index_name: str):
+    if index_name not in _retrievers_documents_cache:
+        embeddings = _get_embeddings()
+        vector_store = FAISS.load_local(
+            str(INDEXES_DIR / index_name), embeddings, allow_dangerous_deserialization=True
+        )
+        _retrievers_documents_cache[index_name] = vector_store.as_retriever(search_kwargs={"k": 5})
+    return _retrievers_documents_cache[index_name]
+
+
+def _slug_outil(titre: str) -> str:
+    """Nom d'outil valide dérivé du titre du document (ex. 'Rapport Annuel
+    2025' -> 'rechercher_rapport_annuel_2025') — accents normalisés en ASCII
+    (certaines API de tool-calling n'acceptent pas les caractères accentués
+    dans un nom d'outil)."""
+    remplacements = {"é": "e", "è": "e", "ê": "e", "à": "a", "î": "i", "ô": "o", "ù": "u", "ç": "c"}
+    titre_normalise = titre.lower()
+    for accent, lettre in remplacements.items():
+        titre_normalise = titre_normalise.replace(accent, lettre)
+    slug = "".join(c if c.isascii() and c.isalnum() else "_" for c in titre_normalise)
+    while "__" in slug:
+        slug = slug.replace("__", "_")
+    return f"rechercher_{slug.strip('_')}"
+
+
+def _fabriquer_outil_document(document: dict) -> StructuredTool:
+    """Un outil de recherche pour UN document précis — nom et description
+    dérivés de son titre, pour que l'agent sache CE que couvre ce document
+    sans avoir à l'ouvrir."""
+    retriever = _get_retriever_document(document["index_name"])
+    titre = document["titre"]
 
     def _fonction(requete: str) -> str:
         docs = retriever.invoke(requete)
         if not docs:
-            return "Aucun passage pertinent trouvé dans le document pour cette recherche."
+            return f"Aucun passage pertinent trouvé dans « {titre} » pour cette recherche."
         return "\n\n".join(
-            f"[Page {doc.metadata.get('page', '?')}] {doc.page_content}" for doc in docs
+            f"[{titre}, page {doc.metadata.get('page', '?')}] {doc.page_content}" for doc in docs
         )
 
-    outil_document = StructuredTool.from_function(
-        func=_fonction, name="rechercher_dans_document",
-        description="Cherche un passage dans le document PDF attaché à cette session.",
+    return StructuredTool.from_function(
+        func=_fonction,
+        name=_slug_outil(titre),
+        description=f"Cherche un passage dans le document « {titre} ».",
         args_schema=ArgsRecherche,
     )
 
-    prompt_document = """Tu es le spécialiste documentaire de MAF. Tu lis le
-PDF attaché via rechercher_dans_document. Cite TOUJOURS la page source (p.X)
-pour chaque affirmation factuelle. Si l'info n'y est pas, dis-le explicitement."""
 
-    return create_agent(model, [outil_document], system_prompt=prompt_document)
+def _construire_agent_documents(documents: list) -> object:
+    """
+    Construit UN agent documentaire ayant accès à TOUS les documents fournis
+    (un outil de recherche par document). documents : liste de
+    {"index_name":..., "titre":...} (voir DemandingIngest.documents_pour_entreprise).
+    """
+    outils = [_fabriquer_outil_document(doc) for doc in documents]
+    liste_titres = "\n".join(f"- {doc['titre']}" for doc in documents)
+
+    prompt_document = f"""Tu es le spécialiste documentaire de MAF. Tu as
+accès à PLUSIEURS documents de la même entreprise, chacun avec son propre
+outil de recherche :
+{liste_titres}
+
+RÈGLES :
+- Choisis le(s) document(s) pertinent(s) d'après la question — un rapport
+  annuel 2025 et des résultats T2 2026 ne couvrent pas la même période,
+  fais attention à ne pas mélanger les deux sans le dire.
+- Pour une COMPARAISON entre périodes, consulte plusieurs documents dans le
+  même tour et articule clairement quelle donnée vient de quel document.
+- Cite TOUJOURS le document ET la page source (déjà inclus dans le résultat
+  de chaque outil, sous la forme [Titre, page X]) pour chaque affirmation.
+- Si l'info n'est dans AUCUN document disponible, dis-le explicitement
+  plutôt que d'inférer ou de piocher dans un autre document par erreur."""
+
+    return create_agent(model, outils, system_prompt=prompt_document)
 
 
 def _choisir_document() -> str | None:
@@ -226,7 +282,9 @@ def construire_outils(index_name: str | None = None, agents_autorises: set | Non
             "agent_base_donnees",
             "Interroge une base SQL réelle de ~180 entreprises collectées : comparaisons "
             "entre entreprises, statistiques sectorielles, détection de valeurs atypiques, "
-            "score de risque composite. Ne fait NI prédiction ML NI analyse technique.",
+            "score de risque composite, ET recherche d'entreprises correspondant à un "
+            "profil (screening multi-critères — secteur, ROE, endettement...). Ne fait "
+            "NI prédiction ML NI analyse technique.",
             agent_base_donnees,
         )),
         ("agent_estimation", _agent_vers_outil(
@@ -251,12 +309,55 @@ def construire_outils(index_name: str | None = None, agents_autorises: set | Non
         )),
     ]
 
-    if index_name:
-        agent_document = _construire_agent_document(index_name)
+def construire_outils(documents: list | None = None, agents_autorises: set | None = None) -> list:
+    """
+    documents : liste de {"index_name":..., "titre":...} (voir
+    DemandingIngest.documents_pour_entreprise) — None ou liste vide = pas
+    d'agent documentaire pour cette session.
+    agents_autorises : None = tous les agents disponibles (sélection
+    automatique optimale par l'orchestrateur). Sinon, un sous-ensemble de
+    noms d'agents — restriction manuelle décidée par l'utilisateur.
+    """
+    candidats = [
+        ("agent_base_donnees", _agent_vers_outil(
+            "agent_base_donnees",
+            "Interroge une base SQL réelle de ~180 entreprises collectées : comparaisons "
+            "entre entreprises, statistiques sectorielles, détection de valeurs atypiques, "
+            "score de risque composite, ET recherche d'entreprises correspondant à un "
+            "profil (screening multi-critères — secteur, ROE, endettement...). Ne fait "
+            "NI prédiction ML NI analyse technique.",
+            agent_base_donnees,
+        )),
+        ("agent_estimation", _agent_vers_outil(
+            "agent_estimation",
+            "Modèles statistiques ENTRAÎNÉS ET VALIDÉS pour ESTIMER un indicateur (marge "
+            "nette, ROE, ROA, croissance du CA) à partir de paramètres hypothétiques fournis "
+            "par l'utilisateur — pas pour relire une donnée déjà connue.",
+            agent_estimation,
+        )),
+        ("agent_technique", _agent_vers_outil(
+            "agent_technique",
+            "Analyse la tendance récente (momentum, accélération) du cours boursier d'un "
+            "ticker donné. Indicateur descriptif, non validé statistiquement.",
+            agent_technique,
+        )),
+        ("agent_recherche_web", _agent_vers_outil(
+            "agent_recherche_web",
+            "Recherche sur internet (Tavily) une information récente, externe ou d'actualité "
+            "(taux macroéconomiques actuels, actualité d'une entreprise, événement récent) "
+            "avec citation systématique de la source.",
+            agent_recherche_web,
+        )),
+    ]
+
+    if documents:
+        agent_document = _construire_agent_documents(documents)
+        liste_titres = ", ".join(d["titre"] for d in documents)
         candidats.append(("agent_document", _agent_vers_outil(
             "agent_document",
-            "Cherche une information dans le document PDF attaché à cette session, "
-            "avec citation de page systématique.",
+            f"Cherche une information dans les documents attachés à cette entreprise "
+            f"({liste_titres}) — peut consulter plusieurs documents dans le même appel "
+            f"pour une comparaison entre périodes, avec citation de document et de page.",
             agent_document,
         )))
 
@@ -273,7 +374,7 @@ def construire_system_prompt(document_attache: bool, due_diligence_disponible: b
         "- agent_recherche_web : information externe récente, avec sources citées.\n"
     )
     if document_attache:
-        liste_agents += "- agent_document : contenu du PDF attaché à cette session, avec pages citées.\n"
+        liste_agents += "- agent_document : contenu des documents attachés à cette entreprise, avec document et page cités.\n"
     if due_diligence_disponible:
         liste_agents += (
             "- lancer_due_diligence : exécute une checklist COMPLÈTE (rentabilité, "
@@ -339,24 +440,34 @@ _agents_cache: dict = {}
 
 
 def construire_agent(
-    index_name: str | None = None,
+    documents: list | None = None,
     agents_autorises: frozenset | None = None,
     _inclure_due_diligence: bool = True,
 ):
     """
+    documents : liste de {"index_name":..., "titre":...} (peut contenir
+    plusieurs documents de la même entreprise), ou None/liste vide.
+
     _inclure_due_diligence=False est réservé à l'usage INTERNE de
     lancer_due_diligence() — sans ce garde-fou, l'agent utilisé PENDANT une
     due diligence pourrait se relancer lui-même en due diligence, créant une
     récursion infinie. L'agent principal (celui qui parle à l'utilisateur)
     garde toujours l'outil.
     """
-    cle_cache = (index_name, agents_autorises, _inclure_due_diligence)
+    documents = documents or []
+    # Les dicts ne sont pas hashables -> clé de cache basée sur un tuple
+    # trié des index_name, suffisant puisque le contenu d'un document
+    # indexé ne change jamais après coup (seul l'ENSEMBLE de documents
+    # attachés à une entreprise peut évoluer).
+    cle_documents = tuple(sorted(d["index_name"] for d in documents))
+    cle_cache = (cle_documents, agents_autorises, _inclure_due_diligence)
+
     if cle_cache not in _agents_cache:
-        outils = construire_outils(index_name, agents_autorises)
+        outils = construire_outils(documents, agents_autorises)
         if _inclure_due_diligence:
-            outils = outils + [_outil_due_diligence(index_name)]
+            outils = outils + [_outil_due_diligence(documents)]
         prompt = construire_system_prompt(
-            document_attache=index_name is not None,
+            document_attache=len(documents) > 0,
             due_diligence_disponible=_inclure_due_diligence,
         )
         _agents_cache[cle_cache] = create_agent(model, outils, system_prompt=prompt)
@@ -399,15 +510,16 @@ def agents_mobilises(messages: list, nb_avant: int) -> list:
 # pas comme un bouton séparé — c'est le superviseur qui juge, selon le
 # principe d'optimalité, quand la déclencher.
 # ─────────────────────────────────────────────────────────────────────────
-def lancer_due_diligence(entreprise: str, index_name: str | None = None) -> list[dict]:
+def lancer_due_diligence(entreprise: str, documents: list | None = None) -> list[dict]:
     """
     Construit l'agent (SANS l'outil lancer_due_diligence lui-même — sinon
     récursion infinie possible) et délègue l'exécution de la checklist à
-    DueDiligenceAgent.executer_due_diligence().
+    DueDiligenceAgent.executer_due_diligence(). documents : liste de
+    {"index_name":..., "titre":...}, ou None.
     """
-    agent = construire_agent(index_name, _inclure_due_diligence=False)
+    agent = construire_agent(documents, _inclure_due_diligence=False)
     return executer_due_diligence(
-        agent, entreprise, index_name,
+        agent, entreprise, documents,
         agents_mobilises, formater_source, extraire_texte, TRACE_DERNIER_TOUR,
     )
 
@@ -416,15 +528,15 @@ class ArgsDueDiligence(BaseModel):
     entreprise: str = Field(description="Nom exact de l'entreprise, tel qu'il apparaît dans la base de données")
 
 
-def _outil_due_diligence(index_name: str | None) -> StructuredTool:
+def _outil_due_diligence(documents: list | None) -> StructuredTool:
     """
     Encapsule lancer_due_diligence() en outil pour l'agent principal.
-    IMPORTANT : lancer_due_diligence() appelle construire_agent(index_name,
+    IMPORTANT : lancer_due_diligence() appelle construire_agent(documents,
     _inclure_due_diligence=False) en interne — l'agent utilisé PENDANT la
     due diligence n'a PAS cet outil, ce qui évite toute récursion.
     """
     def _fonction(entreprise: str) -> str:
-        rapport = lancer_due_diligence(entreprise, index_name)
+        rapport = lancer_due_diligence(entreprise, documents)
         lignes = [f"## Due diligence structurée — {entreprise}\n"]
         for section in rapport:
             lignes.append(f"### {section['categorie']}")
@@ -440,7 +552,7 @@ def _outil_due_diligence(index_name: str | None) -> StructuredTool:
         description=(
             "Exécute une checklist complète de due diligence financière (rentabilité, "
             "endettement, liquidité/risque, valorisation, tendance boursière, actualité"
-            + (", cohérence avec le document" if index_name else "") +
+            + (", cohérence avec les documents attachés" if documents else "") +
             ") pour UNE entreprise. RÉSERVÉ aux demandes explicitement larges — "
             "n'utilise JAMAIS cet outil pour une question ciblée sur un seul aspect "
             "(dans ce cas, l'agent spécialisé concerné suffit et coûte moins cher)."
@@ -451,12 +563,13 @@ def _outil_due_diligence(index_name: str | None) -> StructuredTool:
 
 if __name__ == "__main__":
     index_choisi = _choisir_document()
-    agent = construire_agent(index_choisi)
+    documents = [{"index_name": index_choisi, "titre": index_choisi.replace("_index", "")}] if index_choisi else []
+    agent = construire_agent(documents)
 
-    nb_agents = 6 if index_choisi else 5
+    nb_agents = 6 if documents else 5
     print(f"\n🧭 Orchestrateur MAF prêt — {nb_agents} agents/outils disponibles, sélection optimale.")
-    if index_choisi:
-        print(f"📄 Document attaché : {index_choisi.replace('_index', '')}")
+    if documents:
+        print(f"📄 Document attaché : {documents[0]['titre']}")
     print("Tapez 'exit' pour quitter.\n")
 
     messages = []

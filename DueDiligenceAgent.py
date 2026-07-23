@@ -69,11 +69,12 @@ CHECKLIST_DUE_DILIGENCE = [
 ]
 
 CHECKLIST_ITEM_DOCUMENT = {
-    "categorie": "Cohérence avec le document",
+    "categorie": "Cohérence avec les documents",
     "question": (
-        "Les chiffres du document attaché (chiffre d'affaires, bénéfice net, marges) "
-        "sont-ils cohérents avec les données de notre base pour {entreprise} ? Signale "
-        "tout écart notable entre les deux sources."
+        "Les chiffres des documents attachés (chiffre d'affaires, bénéfice net, marges) "
+        "sont-ils cohérents avec les données de notre base pour {entreprise}, ET entre "
+        "eux si plusieurs documents couvrent des périodes différentes ? Signale tout "
+        "écart notable."
     ),
 }
 
@@ -81,7 +82,7 @@ CHECKLIST_ITEM_DOCUMENT = {
 def executer_due_diligence(
     agent,
     entreprise: str,
-    index_name: str | None,
+    documents: list | None,
     agents_mobilises,
     formater_source,
     extraire_texte,
@@ -90,13 +91,14 @@ def executer_due_diligence(
     """
     Exécute la checklist pour UNE entreprise, dans une seule mémoire d'agent
     continue (chaque catégorie peut s'appuyer sur les réponses précédentes).
+    documents : liste de {"index_name":..., "titre":...}, ou None.
 
     Paramètres injectés plutôt qu'importés (agent déjà construit,
     fonctions utilitaires de Monitor.py, trace partagée) — c'est ce qui
     permet à ce module de rester indépendant de Monitor.py au niveau import.
     """
     checklist = list(CHECKLIST_DUE_DILIGENCE)
-    if index_name:
+    if documents:
         checklist = checklist + [CHECKLIST_ITEM_DOCUMENT]
 
     messages: list = []

@@ -1,7 +1,9 @@
 import os
 import sys
 import time
+import json
 from pathlib import Path
+from datetime import datetime
 from langchain_community.document_loaders import PyPDFLoader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_google_genai import GoogleGenerativeAIEmbeddings
@@ -25,7 +27,7 @@ INDEXES_DIR.mkdir(exist_ok=True)
 # chaque chunk : le temps d'ingestion devient quasi proportionnel au nombre
 # de batchs, pas au nombre de chunks.
 
-BATCH_SIZE = 48         # nombre de chunks envoyés par appel API                
+BATCH_SIZE = 40         # nombre de chunks envoyés par appel API
 PAUSE_ENTRE_BATCHS = 30 # secondes, marge de sécurité anti-quota entre batchs
 _embeddings = None  # variable globale pour stocker l'instance d'embeddings
 
@@ -130,6 +132,129 @@ def process_and_index_pdf(uploaded_file) -> str:
     vector_store.save_local(str(dossier_index))
 
     return f"{nom_fichier}_index"
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Registre entreprise -> documents — permet à une conversation d'être liée
+# à une ENTREPRISE plutôt qu'à un seul document : plusieurs rapports
+# (annuel 2025, T2 2026...) peuvent être associés à la même entreprise, et
+# ajoutés à n'importe quel moment (le registre est relu à chaque appel,
+# jamais figé dans une conversation).
+# ─────────────────────────────────────────────────────────────────────────
+REGISTRE_PATH = Path("documents_entreprises.json")
+
+
+def _charger_registre() -> dict:
+    if REGISTRE_PATH.exists():
+        return json.loads(REGISTRE_PATH.read_text(encoding="utf-8"))
+    return {}
+
+
+def _sauver_registre(registre: dict):
+    REGISTRE_PATH.write_text(json.dumps(registre, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def lister_entreprises() -> list:
+    """Toutes les entreprises ayant au moins un document associé."""
+    return sorted(_charger_registre().keys())
+
+
+def documents_pour_entreprise(entreprise: str) -> list:
+    """
+    Liste des documents associés à une entreprise, chacun sous la forme
+    {"index_name": ..., "titre": ..., "fichier": ..., "date_ajout": ...}.
+    Relu depuis le disque à chaque appel — pas de cache — pour qu'un
+    document ajouté après coup soit immédiatement visible partout.
+    """
+    return _charger_registre().get(entreprise, [])
+
+
+def associer_document_entreprise(entreprise: str, index_name: str, titre_affiche: str, fichier: str):
+    """
+    Associe un document déjà indexé (index_name) à une entreprise. Si le
+    document (même index_name) est déjà associé à cette entreprise, ne
+    duplique pas l'entrée.
+    """
+    registre = _charger_registre()
+    documents = registre.setdefault(entreprise, [])
+
+    if any(d["index_name"] == index_name for d in documents):
+        return  # déjà associé, rien à faire
+
+    documents.append({
+        "index_name": index_name,
+        "titre": titre_affiche,
+        "fichier": fichier,
+        "date_ajout": datetime.now().isoformat(),
+    })
+    _sauver_registre(registre)
+
+
+def retirer_document_entreprise(entreprise: str, index_name: str):
+    """Détache un document d'une entreprise (ne supprime pas l'index FAISS
+    lui-même, juste l'association — le document reste réutilisable ailleurs)."""
+    registre = _charger_registre()
+    if entreprise not in registre:
+        return
+    registre[entreprise] = [d for d in registre[entreprise] if d["index_name"] != index_name]
+    if not registre[entreprise]:
+        del registre[entreprise]
+    _sauver_registre(registre)
+
+
+def _normaliser(texte: str) -> str:
+    """Minuscule, accents retirés, tout caractère non-alphanumérique
+    supprimé — pour comparer un nom d'entreprise à un nom de fichier
+    malgré les tirets/underscores/espaces/majuscules qui diffèrent."""
+    remplacements = {"é": "e", "è": "e", "ê": "e", "à": "a", "î": "i", "ô": "o", "ù": "u", "ç": "c"}
+    t = texte.lower()
+    for accent, lettre in remplacements.items():
+        t = t.replace(accent, lettre)
+    return "".join(c for c in t if c.isalnum())
+
+
+def associer_documents_automatiquement(entreprise: str) -> list:
+    """
+    Recherche, parmi TOUS les documents présents dans documents/ (indexés ou
+    non), ceux dont le nom de fichier contient le nom de l'entreprise (une
+    fois les deux normalisés) — pas de sélection manuelle nécessaire.
+    Indexe au passage les documents trouvés qui ne le sont pas encore.
+
+    Retourne la liste des titres nouvellement associés lors de CET appel
+    (liste vide si aucun nouveau document trouvé — soit rien ne correspond,
+    soit tout était déjà associé).
+    """
+    entreprise_norm = _normaliser(entreprise)
+    if len(entreprise_norm) < 3:
+        return []  # évite les faux positifs sur des noms trop courts (ex. "SA", "AI")
+
+    deja_associes = {d["index_name"] for d in documents_pour_entreprise(entreprise)}
+    nouveaux = []
+
+    for fichier in lister_documents():
+        fichier_norm = _normaliser(fichier)
+        if entreprise_norm not in fichier_norm:
+            continue
+
+        index_name = f"{fichier}_index"
+        if index_name in deja_associes:
+            continue
+
+        dossier_index = INDEXES_DIR / index_name
+        if not dossier_index.exists():
+            class _FichierLocal:
+                def __init__(self, path: Path):
+                    self.name = path.name
+                    self._data = path.read_bytes()
+                def getbuffer(self):
+                    return self._data
+            process_and_index_pdf(_FichierLocal(DOCS_DIR / fichier))
+
+        titre = fichier.replace(".pdf", "").replace("_", " ").replace("-", " ")
+        associer_document_entreprise(entreprise, index_name, titre, fichier)
+        nouveaux.append(titre)
+
+    return nouveaux
 
 
 if __name__ == "__main__":

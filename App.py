@@ -7,7 +7,11 @@ from pathlib import Path
 from datetime import datetime
 from dotenv import load_dotenv
 
-from DemandingIngest import process_and_index_pdf, lister_documents, INDEXES_DIR, DOCS_DIR
+from DemandingIngest import (
+    process_and_index_pdf, lister_documents, INDEXES_DIR, DOCS_DIR,
+    lister_entreprises, documents_pour_entreprise, associer_document_entreprise, retirer_document_entreprise,
+    associer_documents_automatiquement,
+)
 from PredictionAgent import (
     INDICATEURS_DISPONIBLES,
     get_csv_columns,
@@ -43,6 +47,71 @@ load_dotenv()
 # Configuration
 # ─────────────────────────────────────────────────────────────────────────
 st.set_page_config(page_title="MAF - Interface", layout="wide")
+
+# ─────────────────────────────────────────────────────────────────────────
+# Habillage visuel — se rapproche de ChatGPT/Gemini/Le Chat en typographie
+# et fluidité, sans réécrire les widgets Streamlit en HTML (juste du CSS
+# ciblé sur des sélecteurs data-testid, plus stables entre versions
+# Streamlit que les noms de classes générés). Le CSS est chargé par le
+# navigateur de l'utilisateur, pas par le backend — @import Google Fonts
+# fonctionne normalement, avec repli sur les polices système si bloqué.
+# ─────────────────────────────────────────────────────────────────────────
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
+
+html, body, [class*="css"], [data-testid="stAppViewContainer"], [data-testid="stSidebar"] {
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+}
+
+html { scroll-behavior: smooth; }
+
+/* Transitions douces sur tous les éléments interactifs — "fluidité" */
+button, [data-testid="stExpander"], [data-testid="stChatInput"] textarea,
+input, textarea, [data-testid="stPopover"] button {
+    transition: all 0.18s ease-in-out !important;
+}
+
+/* Boutons arrondis avec léger relief au survol, comme les chat modernes */
+.stButton button, [data-testid="stChatInput"] button, [data-testid="stPopover"] button {
+    border-radius: 12px !important;
+}
+.stButton button:hover {
+    transform: translateY(-1px);
+    box-shadow: 0 4px 12px rgba(0,0,0,0.10);
+}
+
+/* Champ de saisie principal façon ChatGPT/Gemini : très arrondi */
+[data-testid="stChatInput"] {
+    border-radius: 24px !important;
+}
+[data-testid="stChatInput"] textarea {
+    border-radius: 24px !important;
+}
+
+/* Bulles de messages plus douces, moins "cadre de formulaire" */
+[data-testid="stChatMessage"] {
+    border-radius: 16px !important;
+    padding: 6px 10px !important;
+}
+
+/* Expanders et popover arrondis, bordure discrète plutôt que dure */
+[data-testid="stExpander"], [data-testid="stPopoverBody"] {
+    border-radius: 14px !important;
+    border: 1px solid rgba(128,128,128,0.15) !important;
+}
+
+/* Champs texte arrondis, cohérents avec le reste */
+[data-testid="stTextInput"] input, [data-testid="stSelectbox"] > div {
+    border-radius: 10px !important;
+}
+
+/* Sidebar : séparation discrète plutôt qu'un trait dur */
+[data-testid="stSidebar"] {
+    border-right: 1px solid rgba(128,128,128,0.12);
+}
+</style>
+""", unsafe_allow_html=True)
 
 HISTORY_DIR = Path("chat_history")
 TRANSCRIPTS_DIR = Path("transcripts")
@@ -103,14 +172,19 @@ if "afficher_glossaire" not in st.session_state:
     st.session_state.afficher_glossaire = False
 
 
-def demarrer_conversation(titre_affiche: str, index_name=None):
-    """Une seule sorte de conversation désormais : index_name est optionnel
-    (document attaché ou non), toutes pilotées par l'orchestrateur."""
+def demarrer_conversation(titre_affiche: str, entreprise: str | None = None):
+    """
+    Une conversation est désormais liée à une ENTREPRISE (ou aucune, pour
+    une conversation générale) — pas à un document unique. Les documents
+    associés à l'entreprise sont relus depuis le registre à chaque message
+    (DemandingIngest.documents_pour_entreprise), jamais figés ici : un
+    document ajouté après coup devient immédiatement disponible.
+    """
     session_id = str(uuid.uuid4())
     now = datetime.now().isoformat()
     conversations[session_id] = {
         "title": titre_affiche,
-        "document": index_name,
+        "entreprise": entreprise,
         "created_at": now,
         "updated_at": now,
     }
@@ -119,6 +193,27 @@ def demarrer_conversation(titre_affiche: str, index_name=None):
     st.session_state.current_session_id = session_id
     st.session_state.creating_new = False
     st.rerun()
+
+
+def documents_de_la_conversation(meta: dict) -> list:
+    """
+    Documents disponibles pour cette conversation — relus à chaque appel
+    depuis le registre (pas stockés dans la conversation elle-même), pour
+    qu'un document ajouté après coup soit immédiatement disponible.
+
+    Rétrocompatibilité : les conversations créées avant ce système (champ
+    'document' = un seul index_name, pas de champ 'entreprise') continuent
+    de fonctionner avec leur unique document, sans migration nécessaire.
+    """
+    entreprise = meta.get("entreprise")
+    if entreprise:
+        return documents_pour_entreprise(entreprise)
+
+    ancien_document = meta.get("document")
+    if ancien_document:
+        return [{"index_name": ancien_document, "titre": meta.get("title", ancien_document)}]
+
+    return []
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -245,14 +340,6 @@ AGENTS_CONFIG = {
 # ─────────────────────────────────────────────────────────────────────────
 st.sidebar.title("💬 MAF Navigator")
 
-st.sidebar.subheader("📂 Ajouter une entreprise")
-uploaded_file = st.sidebar.file_uploader("Charger un rapport PDF", type="pdf", label_visibility="collapsed")
-if uploaded_file and st.sidebar.button("Indexer ce document"):
-    with st.spinner("Indexation en cours..."):
-        index_name = process_and_index_pdf(uploaded_file)
-    st.sidebar.success(f"Document {uploaded_file.name} ajouté !")
-    demarrer_conversation(uploaded_file.name, index_name)
-
 st.sidebar.divider()
 st.sidebar.subheader("📊 Données de l'estimateur")
 
@@ -334,7 +421,7 @@ for session_id, meta in tri:
             st.rerun()
     else:
         col_titre, col_edit = st.sidebar.columns([5, 1])
-        icone = "📄" if meta.get("document") else "🧭"
+        icone = "🏢" if meta.get("entreprise") else ("📄" if meta.get("document") else "🧭")
         label = f"{'🟢' if actif else '⚪'} {icone} {meta['title']}"
         if col_titre.button(label, key=f"open_{session_id}", use_container_width=True):
             st.session_state.current_session_id = session_id
@@ -357,47 +444,60 @@ if st.sidebar.button("📖 Glossaire", use_container_width=True, help="Définiti
 def ecran_nouvelle_conversation():
     st.title("Nouvelle conversation")
     st.caption(
-        "Toutes les conversations sont désormais pilotées par l'orchestrateur : "
-        "base de données, estimation, recherche web toujours disponibles. "
-        "Attache un document (optionnel) pour qu'il puisse aussi le consulter."
+        "Une conversation est liée à une ENTREPRISE : tu as accès à TOUS les documents "
+        "déjà associés à cette entreprise, sans avoir à préciser lequel — et tu peux en "
+        "ajouter d'autres à tout moment, même en cours de conversation."
     )
 
-    fichiers = lister_documents()
-    options = ["Aucun document"]
-    for f in fichiers:
-        indexe = (INDEXES_DIR / f"{f}_index").exists()
-        options.append(f"{'🟢' if indexe else '🟡'} {f}" + ("" if indexe else " (non indexé)"))
+    entreprises_existantes = lister_entreprises()
+    mode = st.radio(
+        "Entreprise :",
+        ["Aucune (conversation générale)", "Entreprise existante", "Nouvelle entreprise"],
+        horizontal=True,
+    )
 
-    choix = st.selectbox("Document existant à attacher :", options)
+    entreprise = None
+    if mode == "Entreprise existante":
+        if not entreprises_existantes:
+            st.info("Aucune entreprise avec des documents associés pour l'instant.")
+        else:
+            entreprise = st.selectbox("Choisir l'entreprise :", entreprises_existantes)
+    elif mode == "Nouvelle entreprise":
+        entreprise = st.text_input("Nom de l'entreprise (tel qu'il apparaît dans ta base si possible) :")
 
-    st.caption("— ou —")
-    upload = st.file_uploader("Uploader un nouveau PDF à attacher", type="pdf", key="upload_new_conv")
+    # Association AUTOMATIQUE : dès qu'un nom d'entreprise est connu, on
+    # cherche parmi TOUS les documents déjà présents (indexés ou non) ceux
+    # dont le nom de fichier correspond — pas de sélection manuelle requise.
+    if entreprise and entreprise.strip():
+        nouveaux = associer_documents_automatiquement(entreprise.strip())
+        if nouveaux:
+            st.success(f"📎 Document(s) associé(s) automatiquement : {', '.join(nouveaux)}")
+
+        docs_existants = documents_pour_entreprise(entreprise.strip())
+        if docs_existants:
+            st.caption(f"📄 {len(docs_existants)} document(s) au total pour {entreprise} :")
+            for d in docs_existants:
+                st.caption(f"  • {d['titre']}")
+        else:
+            st.caption("Aucun document trouvé automatiquement pour cette entreprise pour l'instant.")
+
+    st.divider()
+    st.markdown("**📎 Ajouter un document** (si pas encore présent dans `documents/`)")
+    upload = st.file_uploader("Nouveau PDF", type="pdf", key="upload_new_conv", label_visibility="collapsed")
+    if upload is not None and entreprise and st.button("Indexer et associer", key="btn_upload_new_conv"):
+        with st.spinner("Indexation en cours..."):
+            index_name = process_and_index_pdf(upload)
+        associer_document_entreprise(entreprise.strip(), index_name, upload.name.replace(".pdf", ""), upload.name)
+        st.success(f"« {upload.name} » associé à {entreprise}.")
+        st.rerun()
+
+    if mode != "Aucune (conversation générale)" and not (entreprise and entreprise.strip()):
+        st.warning("Précise le nom de l'entreprise avant de continuer.")
+        return
 
     if st.button("Démarrer la conversation"):
-        index_name = None
-        titre = f"Conversation {datetime.now().strftime('%d/%m %H:%M')}"
-
-        if upload is not None:
-            with st.spinner("Indexation en cours..."):
-                index_name = process_and_index_pdf(upload)
-            titre = upload.name.replace(".pdf", "")
-        elif choix != "Aucun document":
-            nom_fichier = fichiers[options.index(choix) - 1]
-            indexe = (INDEXES_DIR / f"{nom_fichier}_index").exists()
-            if not indexe:
-                with st.spinner("Indexation en cours..."):
-                    class _FichierLocal:
-                        def __init__(self, path: Path):
-                            self.name = path.name
-                            self._data = path.read_bytes()
-                        def getbuffer(self):
-                            return self._data
-                    index_name = process_and_index_pdf(_FichierLocal(DOCS_DIR / nom_fichier))
-            else:
-                index_name = f"{nom_fichier}_index"
-            titre = nom_fichier
-
-        demarrer_conversation(titre, index_name)
+        titre = entreprise.strip() if entreprise else f"Conversation {datetime.now().strftime('%d/%m %H:%M')}"
+        demarrer_conversation(titre, entreprise=(entreprise.strip() if entreprise else None))
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -440,11 +540,11 @@ def selecteur_manuel_agents(document_attache: bool, session_id: str) -> frozense
 # ─────────────────────────────────────────────────────────────────────────
 # ZONE PRINCIPALE — chat (orchestrateur systématique)
 # ─────────────────────────────────────────────────────────────────────────
-def traiter_message(session_id: str, index_name, user_input: str, transcript: list, agents_autorises):
+def traiter_message(session_id: str, documents: list, user_input: str, transcript: list, agents_autorises):
     transcript.append({"role": "user", "content": user_input, "sources": None})
 
     try:
-        agent = construire_agent(index_name, agents_autorises)
+        agent = construire_agent(documents, agents_autorises)
         historique = st.session_state.orchestrateur_histories.setdefault(session_id, [])
         historique.append({"role": "user", "content": user_input})
 
@@ -509,7 +609,7 @@ def traiter_message(session_id: str, index_name, user_input: str, transcript: li
     sauver_index_conversations(conversations)
 
 
-def afficher_tour(tour: dict):
+def afficher_tour(tour: dict, cle_unique: str = "tour"):
     type_tour = tour.get("type")
 
     if type_tour == "due_diligence":
@@ -517,7 +617,7 @@ def afficher_tour(tour: dict):
 
         radar_data = tour.get("radar_data")
         if radar_data:
-            st.plotly_chart(_radar_entreprise(radar_data), use_container_width=True)
+            st.plotly_chart(_radar_entreprise(radar_data), use_container_width=True, key=f"{cle_unique}_radar_dd")
             if radar_data.get("colonnes_manquantes"):
                 st.caption(
                     f"⚠️ Axes non affichés (colonnes introuvables) : "
@@ -543,11 +643,11 @@ def afficher_tour(tour: dict):
             st.caption(" · ".join(tour["badges"]))
         st.markdown(tour["content"])
 
-        for graphique in tour.get("graphiques", []):
+        for i, graphique in enumerate(tour.get("graphiques", [])):
             if graphique["type"] == "score_risque":
-                st.plotly_chart(_camembert_score_risque(graphique["data"]), use_container_width=True)
+                st.plotly_chart(_camembert_score_risque(graphique["data"]), use_container_width=True, key=f"{cle_unique}_graphique_{i}")
             elif graphique["type"] == "comparaison":
-                st.plotly_chart(_batons_comparaison(graphique["data"]), use_container_width=True)
+                st.plotly_chart(_batons_comparaison(graphique["data"]), use_container_width=True, key=f"{cle_unique}_graphique_{i}")
 
         if tour.get("sources_detaillees"):
             with st.expander(f"📎 {len(tour['sources_detaillees'])} source(s) détaillée(s)"):
@@ -578,95 +678,146 @@ def afficher_tour(tour: dict):
 
 def ecran_chat(session_id: str):
     meta = conversations[session_id]
-    index_name = meta["document"]
+    entreprise = meta.get("entreprise")
+    documents = documents_de_la_conversation(meta)
 
-    if index_name:
+    if entreprise:
+        st.title(f"🏢 {meta['title']}")
+        if documents:
+            st.caption(
+                f"Entreprise : {entreprise} — {len(documents)} document(s) attaché(s) : "
+                + ", ".join(d["titre"] for d in documents)
+            )
+        else:
+            st.caption(f"Entreprise : {entreprise} — aucun document attaché pour l'instant.")
+    elif documents:
         st.title(f"📄 {meta['title']}")
-        st.caption(f"Document attaché : {index_name.replace('_index', '')} — orchestrateur multi-agent actif.")
+        st.caption(f"Document attaché : {documents[0]['titre']} — orchestrateur multi-agent actif.")
     else:
         st.title(f"🧭 {meta['title']}")
         st.caption("Orchestrateur multi-agent — base de données, estimation, recherche web.")
 
-    if index_name:
-        with st.expander("📥 Extraire les données financières de ce document vers la base"):
-            st.caption(
-                "Analyse le document et propose d'ajouter/enrichir la ligne de cette "
-                "entreprise dans la base de données, avec traçabilité par page. "
-                "Rien n'est enregistré sans ta validation ci-dessous."
-            )
-            if st.button("🔍 Lancer l'extraction", key="btn_lancer_extraction"):
-                with st.spinner("Extraction en cours..."):
-                    try:
-                        st.session_state["extraction_en_attente"] = extraire_donnees_du_document(index_name)
-                    except Exception as e:
-                        st.error(f"Erreur d'extraction : {e}")
-
-            extraction_en_attente = st.session_state.get("extraction_en_attente")
-            if extraction_en_attente:
-                st.write("**Aperçu — vérifie avant d'enregistrer :**")
-                st.json(extraction_en_attente.model_dump())
-                col_ok, col_annuler = st.columns(2)
-                if col_ok.button("✅ Enregistrer dans la base", key="btn_confirmer_extraction"):
-                    resultat = enregistrer_extraction(extraction_en_attente)
-                    with st.spinner("Réentraînement des modèles..."):
-                        retrain_tous()
-                    st.success(f"Entreprise {resultat['action']} : {resultat['entreprise']}")
-                    st.session_state["extraction_en_attente"] = None
-                if col_annuler.button("✕ Annuler", key="btn_annuler_extraction"):
-                    st.session_state["extraction_en_attente"] = None
-
-    with st.expander("🔎 Lancer une due diligence structurée"):
-        st.caption(
-            "Exécute une checklist fixe (rentabilité, endettement, liquidité/risque, "
-            "valorisation, tendance boursière, actualité" +
-            (", cohérence avec le document" if index_name else "") +
-            ") plutôt que de poser les questions une par une."
-        )
-        entreprise_dd = st.text_input(
-            "Nom exact de l'entreprise (tel qu'il apparaît dans la base) :",
-            key=f"entreprise_dd_{session_id}",
-        )
-        if st.button("🚀 Lancer la due diligence", key=f"btn_dd_{session_id}", disabled=not entreprise_dd.strip()):
-            with st.spinner(f"Due diligence en cours pour {entreprise_dd}… (6-7 questions séquentielles, peut prendre 1-2 minutes)"):
-                try:
-                    rapport = lancer_due_diligence(entreprise_dd.strip(), index_name)
-                    radar_data = donnees_radar_entreprise(entreprise_dd.strip())
-                    transcript_tmp = charger_transcript(session_id)
-                    transcript_tmp.append({
-                        "role": "assistant",
-                        "type": "due_diligence",
-                        "entreprise": entreprise_dd.strip(),
-                        "rapport": rapport,
-                        "radar_data": radar_data,
-                    })
-                    sauver_transcript(session_id, transcript_tmp)
-                    conversations[session_id]["updated_at"] = datetime.now().isoformat()
-                    sauver_index_conversations(conversations)
-                except Exception as e:
-                    st.error(f"Erreur pendant la due diligence : {e}")
-            st.rerun()
-
-    with st.expander("📊 Comparaison visuelle rapide (radar, sans due diligence complète)"):
-        st.caption("Juste le radar entreprise vs secteur — sans les 6-7 questions détaillées.")
-        entreprise_radar = st.text_input(
-            "Nom de l'entreprise :", key=f"entreprise_radar_{session_id}",
-        )
-        if st.button("Afficher le radar", key=f"btn_radar_{session_id}", disabled=not entreprise_radar.strip()):
-            radar_data = donnees_radar_entreprise(entreprise_radar.strip())
-            if radar_data is None:
-                st.error(f"Entreprise '{entreprise_radar}' non trouvée avec certitude dans la base.")
-            else:
-                st.plotly_chart(_radar_entreprise(radar_data), use_container_width=True)
-                if radar_data.get("colonnes_manquantes"):
-                    st.caption(f"⚠️ Axes non affichés : {', '.join(radar_data['colonnes_manquantes'])}")
-
     transcript = charger_transcript(session_id)
 
-    for tour in transcript:
+    for idx, tour in enumerate(transcript):
         with st.chat_message("user" if tour["role"] == "user" else "assistant"):
-            afficher_tour(tour)
+            afficher_tour(tour, cle_unique=f"{session_id}_tour{idx}")
 
-    agents_autorises = selecteur_manuel_agents(document_attache=index_name is not None, session_id=session_id)
+    # ── Menu "➕" — regroupe tous les outils annexes juste au-dessus de la
+    # saisie, au lieu de 4 blocs empilés qui prenaient toute la largeur de
+    # l'écran. Streamlit ne permet pas de vrai bouton accolé au champ de
+    # saisie lui-même (st.chat_input est un widget à part, plein largeur) —
+    # le popover juste au-dessus est l'équivalent le plus proche.
+    with st.popover("➕ Outils", use_container_width=False):
+        if st.button("📖 Glossaire", key=f"popover_glossaire_{session_id}", use_container_width=True):
+            st.session_state.afficher_glossaire = True
+            st.rerun()
+
+        st.divider()
+
+        if entreprise:
+            with st.expander("📎 Ajouter un document"):
+                st.caption(
+                    f"Immédiatement disponible dans cette conversation et toute autre "
+                    f"conversation liée à {entreprise}."
+                )
+                nouveau_doc = st.file_uploader("Nouveau PDF", type="pdf", key=f"ajout_doc_{session_id}")
+                if nouveau_doc and st.button("Indexer et associer", key=f"btn_ajout_doc_{session_id}"):
+                    with st.spinner("Indexation en cours..."):
+                        index_name = process_and_index_pdf(nouveau_doc)
+                    associer_document_entreprise(
+                        entreprise, index_name, nouveau_doc.name.replace(".pdf", ""), nouveau_doc.name,
+                    )
+                    st.success(f"« {nouveau_doc.name} » associé à {entreprise}.")
+                    st.rerun()
+
+        if documents:
+            with st.expander("📥 Extraire des données vers la base"):
+                st.caption(
+                    "Analyse un document et propose d'ajouter/enrichir la ligne de cette "
+                    "entreprise dans la base, avec traçabilité par page. Rien n'est "
+                    "enregistré sans validation."
+                )
+                if len(documents) == 1:
+                    document_a_extraire = documents[0]
+                else:
+                    titre_choisi = st.selectbox(
+                        "Quel document extraire ?", [d["titre"] for d in documents], key=f"choix_extraction_{session_id}",
+                    )
+                    document_a_extraire = next(d for d in documents if d["titre"] == titre_choisi)
+
+                if st.button("🔍 Lancer l'extraction", key="btn_lancer_extraction"):
+                    with st.spinner("Extraction en cours..."):
+                        try:
+                            st.session_state["extraction_en_attente"] = extraire_donnees_du_document(document_a_extraire["index_name"])
+                        except Exception as e:
+                            st.error(f"Erreur d'extraction : {e}")
+
+                extraction_en_attente = st.session_state.get("extraction_en_attente")
+                if extraction_en_attente:
+                    st.write("**Aperçu — vérifie avant d'enregistrer :**")
+                    st.json(extraction_en_attente.model_dump())
+                    col_ok, col_annuler = st.columns(2)
+                    if col_ok.button("✅ Enregistrer", key="btn_confirmer_extraction"):
+                        resultat = enregistrer_extraction(extraction_en_attente)
+                        with st.spinner("Réentraînement des modèles..."):
+                            retrain_tous()
+                        st.success(f"Entreprise {resultat['action']} : {resultat['entreprise']}")
+                        st.session_state["extraction_en_attente"] = None
+                    if col_annuler.button("✕ Annuler", key="btn_annuler_extraction"):
+                        st.session_state["extraction_en_attente"] = None
+
+        with st.expander("🔎 Due diligence structurée"):
+            st.caption(
+                "Checklist fixe (rentabilité, endettement, liquidité/risque, valorisation, "
+                "tendance, actualité" + (", cohérence documents" if documents else "") +
+                ") plutôt que question par question."
+            )
+            if entreprise:
+                entreprise_dd = entreprise
+                st.caption(f"Entreprise : **{entreprise}**")
+            else:
+                entreprise_dd = st.text_input(
+                    "Nom exact de l'entreprise :", key=f"entreprise_dd_{session_id}",
+                )
+            if st.button("🚀 Lancer la due diligence", key=f"btn_dd_{session_id}", disabled=not entreprise_dd.strip()):
+                with st.spinner(f"Due diligence en cours pour {entreprise_dd}… (1-2 minutes)"):
+                    try:
+                        rapport = lancer_due_diligence(entreprise_dd.strip(), documents)
+                        radar_data = donnees_radar_entreprise(entreprise_dd.strip())
+                        transcript_tmp = charger_transcript(session_id)
+                        transcript_tmp.append({
+                            "role": "assistant",
+                            "type": "due_diligence",
+                            "entreprise": entreprise_dd.strip(),
+                            "rapport": rapport,
+                            "radar_data": radar_data,
+                        })
+                        sauver_transcript(session_id, transcript_tmp)
+                        conversations[session_id]["updated_at"] = datetime.now().isoformat()
+                        sauver_index_conversations(conversations)
+                    except Exception as e:
+                        st.error(f"Erreur pendant la due diligence : {e}")
+                st.rerun()
+
+        with st.expander("📊 Radar rapide (sans due diligence complète)"):
+            if entreprise:
+                entreprise_radar = entreprise
+                st.caption(f"Entreprise : **{entreprise}**")
+            else:
+                entreprise_radar = st.text_input(
+                    "Nom de l'entreprise :", key=f"entreprise_radar_{session_id}",
+                )
+            if st.button("Afficher le radar", key=f"btn_radar_{session_id}", disabled=not entreprise_radar.strip()):
+                radar_data = donnees_radar_entreprise(entreprise_radar.strip())
+                if radar_data is None:
+                    st.error(f"Entreprise '{entreprise_radar}' non trouvée avec certitude.")
+                else:
+                    st.plotly_chart(_radar_entreprise(radar_data), use_container_width=True, key=f"radar_rapide_{session_id}")
+                    if radar_data.get("colonnes_manquantes"):
+                        st.caption(f"⚠️ Axes non affichés : {', '.join(radar_data['colonnes_manquantes'])}")
+
+        agents_autorises = selecteur_manuel_agents(document_attache=len(documents) > 0, session_id=session_id)
 
     if prompt := st.chat_input("Posez votre question :"):
         with st.chat_message("user"):
@@ -674,8 +825,8 @@ def ecran_chat(session_id: str):
 
         with st.chat_message("assistant"):
             with st.spinner("Réflexion (sélection des agents nécessaires)..."):
-                traiter_message(session_id, index_name, prompt, transcript, agents_autorises)
-            afficher_tour(transcript[-1])
+                traiter_message(session_id, documents, prompt, transcript, agents_autorises)
+            afficher_tour(transcript[-1], cle_unique=f"{session_id}_tour{len(transcript)-1}_nouveau")
 
 
 # ─────────────────────────────────────────────────────────────────────────
