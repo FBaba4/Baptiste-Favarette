@@ -1,0 +1,21 @@
+{
+  "date_maj": "2026-07-03",
+  "a_verifier_apres": "2026-07-31",
+  "zone_euro": {
+    "taux_refi_bce": "2,40 %",
+    "taux_depot_bce": "2,25 %",
+    "taux_pret_marginal_bce": "2,65 %",
+    "inflation_projetee_2026": "3,0 %",
+    "inflation_projetee_2027": "2,3 %",
+    "objectif_inflation_bce": "2,0 %",
+    "contexte": "Première hausse des taux directeurs de la BCE depuis 2023 (décidée le 11 juin 2026, effective au 17 juin 2026), motivée par des pressions inflationnistes liées aux tensions au Moyen-Orient et à la hausse des prix de l'énergie. Prévisions de croissance du PIB zone euro révisées à la baisse (0,8 % en 2026, 1,2 % en 2027)."
+  },
+  "etats_unis": {
+    "taux_fed_fourchette": "3,50 % - 3,75 %",
+    "inflation_pce_projetee_2026": "3,6 %",
+    "objectif_inflation_fed": "2,0 %",
+    "contexte": "La Fed maintient ses taux inchangés pour la 4e réunion consécutive (juin 2026), sous la présidence du nouveau président Kevin Warsh. Inflation jugée persistante et supérieure à l'objectif. Pas de baisse de taux anticipée à court terme par le consensus des économistes."
+  },
+  "tendances_generales": "Contexte de tensions géopolitiques (Moyen-Orient, prix de l'énergie) pesant sur l'inflation globale ; les banques centrales privilégient une posture prudente à restrictive plutôt qu'un assouplissement monétaire rapide. Incertitude élevée sur la trajectoire à moyen terme.",
+  "note_fiabilite": "Ces chiffres sont une photographie ponctuelle collectée manuellement et doivent être revérifiés/actualisés régulièrement (voir 'a_verifier_apres'). Ne pas les présenter comme temps réel."
+}
